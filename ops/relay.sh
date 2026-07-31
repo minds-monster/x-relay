@@ -44,12 +44,24 @@ relay_key() {
 }
 
 # Reachability check with a clear message, since "connection refused" confuses everyone.
+#
+# Retries three times with a generous timeout: through an ngrok tunnel the first request
+# after an idle period regularly takes several seconds, and a single short timeout made
+# every command intermittently claim the relay was down when it was fine.
 require_up() {
-  if ! curl -s -m 5 "$BASE/health" > /dev/null 2>&1; then
-    echo "Cannot reach the relay at $BASE" >&2
-    echo "Is 'npx wrangler dev' running in another terminal?" >&2
-    exit 1
+  i=1
+  while [ "$i" -le 3 ]; do
+    if curl -s -m 20 "$BASE/health" > /dev/null 2>&1; then
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  echo "Cannot reach the relay at $BASE (3 attempts)" >&2
+  echo "Is 'npx wrangler dev' running in another terminal?" >&2
+  if [ "${BASE#https://}" != "$BASE" ]; then
+    echo "This is a tunnel URL — also check that 'ngrok http 8787' is still running." >&2
   fi
+  exit 1
 }
 
 sql() { npx wrangler d1 execute x-relay --local --command "$1" --json 2>/dev/null; }

@@ -12,8 +12,14 @@ export const MIND_ID = '240b453e-f36b-1410-8466-00039ce7df11'; // "Adam"
 /** Human-facing thread (created by the webapp). Used for HITL drafts and approvals. */
 export const HUMAN_ALIAS = 'webapp:thread-1785477354652-a9tmbv';
 
-/** Machine traffic. Arbitrary-alias acceptance is unverified — see resolveOpsAlias(). */
-export const OPS_ALIAS = 'relay:x-ops';
+/**
+ * Machine traffic, kept separate from the human thread.
+ *
+ * Overridable via RELAY_OPS_ALIAS because a long-lived conversation eventually starts
+ * replaying earlier answers instead of doing the work — switching to a fresh alias is the
+ * cheapest cure, since it removes the history there is to replay from.
+ */
+export const OPS_ALIAS = process.env.RELAY_OPS_ALIAS || 'relay:x-ops';
 
 const builderApiKey = process.env.MINDS_BUILDER_API_KEY;
 if (!builderApiKey) {
@@ -28,13 +34,14 @@ export const client = createMindsClient({ builderApiKey });
  * The platform may only accept `webapp:`-prefixed aliases. Try the dedicated ops
  * conversation and fall back to the existing human thread rather than failing.
  */
-export async function resolveOpsAlias(): Promise<string> {
+export async function resolveOpsAlias(preferred?: string): Promise<string> {
+  const alias = preferred || OPS_ALIAS;
   try {
-    await client.ensureConversation(OPS_ALIAS, MIND_ID);
-    return OPS_ALIAS;
+    await client.ensureConversation(alias, MIND_ID);
+    return alias;
   } catch (err) {
     console.warn(
-      `[minds] alias "${OPS_ALIAS}" rejected (${errText(err)}); falling back to ${HUMAN_ALIAS}`,
+      `[minds] alias "${alias}" rejected (${errText(err)}); falling back to ${HUMAN_ALIAS}`,
     );
     return HUMAN_ALIAS;
   }

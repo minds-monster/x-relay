@@ -48,6 +48,31 @@ interface PostBody {
   allowUrl?: boolean;
   dryRun?: boolean;
   replyToTweetId?: string;
+  /**
+   * Caller-supplied proof-of-execution token. The caller generates a fresh random value
+   * per request and later checks the audit log for it.
+   *
+   * This exists because an LLM caller may report a plausible outcome without having made
+   * the call at all — observed in testing, where a Mind replayed an earlier response
+   * verbatim. Absence of a matching audit row is only weak evidence (the request may
+   * simply have failed); a matching nonce is strong evidence the call really happened,
+   * because the value could not have been known before this request was constructed.
+   */
+  clientNonce?: string;
+}
+
+/** Nonces are echoed into audit.detail, so keep them short and harmless. */
+function safeNonce(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  const trimmed = v.trim();
+  if (!trimmed || trimmed.length > 64) return null;
+  return /^[A-Za-z0-9._:-]+$/.test(trimmed) ? trimmed : null;
+}
+
+/** Append the nonce to an audit detail string so verification can match on it. */
+function withNonce(detail: string | null, nonce: string | null): string | null {
+  if (!nonce) return detail;
+  return detail ? `${detail} nonce=${nonce}` : `nonce=${nonce}`;
 }
 
 /** Free state check. Costs no X credits — the playbook is told to prefer it. */
@@ -83,12 +108,24 @@ post.post('/x/post', async (c) => {
   const allowUrl = body.allowUrl === true;
   const hasUrl = containsUrl(text);
   const textSha256 = await sha256Hex(normalizeText(text));
+  const nonce = safeNonce(body.clientNonce);
 
   // Pure validation first: no DB access, so an invalid request never consumes an
   // idempotency key.
   validateText(text, hasUrl, allowUrl);
 
   if (body.dryRun === true) {
+    // Audit dry runs too. This used to return early without auditing, which meant a
+    // legitimate dry run was indistinguishable from a caller that never called at all —
+    // so the loop's "did this really happen" check reported a false alarm every time.
+    await audit(c.env, {
+      userId: user.user_id,
+      route: 'x/post',
+      via,
+      code: 'dry_run',
+      httpStatus: 200,
+      detail: withNonce(null, nonce),
+    });
     return c.json({
       ok: true,
       dryRun: true,
@@ -97,6 +134,7 @@ post.post('/x/post', async (c) => {
       hasUrl,
       costEstimateUsd: costFor(hasUrl),
       requireApproval: Boolean(user.require_approval),
+      ...(nonce ? { clientNonce: nonce } : {}),
     });
   }
 
@@ -129,6 +167,7 @@ post.post('/x/post', async (c) => {
         via,
         code: 'idempotent_replay',
         httpStatus: 200,
+        detail: withNonce(null, nonce),
       });
       return c.json({
         ok: true,
@@ -189,6 +228,7 @@ post.post('/x/post', async (c) => {
       via,
       code: 'pending_approval',
       httpStatus: 202,
+      detail: withNonce(null, nonce),
     });
     return c.json(
       {
@@ -204,7 +244,7 @@ post.post('/x/post', async (c) => {
     );
   }
 
-  return sendNow(c, postId, text, costUsd, body.replyToTweetId);
+  return sendNow(c, postId, text, costUsd, body.replyToTweetId, nonce);
 });
 
 /** Retract a post. */
@@ -252,6 +292,7 @@ export async function sendNow(
   text: string,
   costUsd: number,
   replyToTweetId?: string,
+  nonce?: string | null,
 ): Promise<Response> {
   const user = c.get('user');
   const via = c.get('via');
@@ -272,7 +313,7 @@ export async function sendNow(
       via,
       code,
       httpStatus: err instanceof RelayError ? err.httpStatus : 502,
-      detail: msg,
+      detail: withNonce(msg, nonce ?? null),
     });
     throw err;
   }
@@ -287,7 +328,7 @@ export async function sendNow(
       via,
       code: 'posted',
       httpStatus: 201,
-      detail: result.tweetId,
+      detail: withNonce(result.tweetId, nonce ?? null),
     });
     return c.json(
       {
@@ -295,6 +336,7 @@ export async function sendNow(
         id: result.tweetId,
         url: tweetUrl(user.x_handle, result.tweetId),
         costEstimateUsd: costUsd,
+        ...(nonce ? { clientNonce: nonce } : {}),
       },
       201,
     );
@@ -311,7 +353,7 @@ export async function sendNow(
       via,
       code,
       httpStatus: err instanceof RelayError ? err.httpStatus : 502,
-      detail: msg,
+      detail: withNonce(msg, nonce ?? null),
     });
     throw err;
   }

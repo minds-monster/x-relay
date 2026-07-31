@@ -523,15 +523,44 @@ sh ops/relay.sh set '{"requireApproval":true,"dailyCap":3,"minIntervalSec":3600,
 The old key keeps working for 24 hours, which is why you re-install the playbook before
 it dies.
 
-### Optional — the content loop
+### Step 28 — the content loop
 
 ```bash
 npm run ops -- ops/daily-loop.ts --dry-run
 npm run ops -- ops/daily-loop.ts --topic "your topic here"
 ```
 
-It prints the cognition balance, the draft the Mind wrote, the outcome, and a `verified:`
-line cross-checking the audit log. It exits non-zero if the relay never saw the call.
+**How this one is built, because it differs from Step 26 on purpose.** The Mind only
+*writes* the post; this script performs the HTTP call itself. An earlier version asked the
+Mind to do both, and it replayed a previous answer verbatim — reporting `dry_run` on a run
+that never requested one — without calling the relay at all. Prompting does not reliably
+fix an agent that skips a side effect and reports success, so the side effect now lives in
+code that cannot skip it.
+
+Two safeguards you'll see in the output:
+
+- **`request id`** — a fresh random value each run. The Mind must echo it back, which is
+  how replayed text is caught before anything is published.
+- **`verified: relay recorded this exact call (nonce=...)`** — the same value is looked up
+  in the relay's audit log afterwards. A missing audit row is ambiguous; a *matching nonce*
+  is proof, because the value did not exist before the run started.
+
+If the Mind replays anyway, the script retries once in a brand-new conversation, which
+removes the history there is to replay from. You'll see `attempt 2 (fresh conversation)`.
+
+Expect:
+
+```
+  attempt 1 (primary) -> relay:x-daily-2026-07-31
+  request id: n7ys8j9ab33ym
+  draft   : Your slowest pages reveal agents first. Humans bounce; agents wait...
+  chars   : 129 (Mind said 129)
+  posted  : http 202
+  APPROVE : https://.../approve/14?t=...
+  verified: relay recorded this exact call (nonce=n7ys8j9ab33ym, via=cron, code=dry_run)
+```
+
+`via=cron` is correct here — this script, not the Mind, made the call.
 
 ---
 

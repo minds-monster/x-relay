@@ -20,7 +20,12 @@ RELAY CONTRACT
 
   2) Create a post.
      POST {base}/x/post
-     {"text":"<=280 chars","idempotencyKey":"<stable id>","allowUrl":false}
+     {"text":"<=280 chars","idempotencyKey":"<stable id>","allowUrl":false,
+      "clientNonce":"<the request id from my instruction, verbatim>"}
+
+     clientNonce is how I confirm server-side that a call actually reached me. Whenever my
+     instruction includes a request id, copy it into clientNonce exactly. It is recorded in
+     my audit log and is not a secret.
 
      201 -> {"ok":true,"id":"...","url":"https://x.com/.../status/...",
              "costEstimateUsd":0.015}
