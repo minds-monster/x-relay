@@ -156,6 +156,79 @@ admin.get('/admin/users/:id', async (c) => {
 });
 
 /**
+ * Replace a user's X app credentials.
+ *
+ * Needed for two real cases: swapping placeholder credentials for real ones without
+ * recreating the user, and recovering from status='client_invalid', which is what the
+ * refresh loop sets when X rejects the client secret (typically because it was rotated
+ * in the X developer portal). Without this route that state has no cure.
+ *
+ * Existing access/refresh tokens were issued by the OLD client, so they cannot survive a
+ * client change: they are cleared and the user must re-authorize.
+ */
+admin.put('/admin/users/:id/x-credentials', async (c) => {
+  const userId = c.req.param('id');
+  const user = await getUser(c.env, userId);
+  if (!user) throw notFound(`No such user: ${userId}`);
+
+  const body = (await c.req.json().catch(() => ({}))) as {
+    clientId?: string;
+    clientSecret?: string;
+    clientType?: string;
+    redirectUri?: string;
+  };
+
+  const clientId = body.clientId?.trim();
+  if (!clientId) throw badRequest('clientId is required');
+
+  const clientType: ClientType = assertClientType(body.clientType ?? user.client_type);
+  const clientSecret = body.clientSecret?.trim() || null;
+  if (clientType === 'confidential' && !clientSecret) {
+    throw badRequest('clientSecret is required when clientType is "confidential"');
+  }
+
+  const redirectUri = (body.redirectUri ?? user.redirect_uri ?? `${c.env.RELAY_BASE_URL}/x/oauth/callback`).trim();
+  try {
+    new URL(redirectUri);
+  } catch {
+    throw badRequest(`redirectUri is not a valid URL: ${redirectUri}`);
+  }
+
+  const clientIdEnc = await encryptForUser(c.env.MASTER_KEY_B64, clientId, 'client', userId);
+  const clientSecretEnc = clientSecret
+    ? await encryptForUser(c.env.MASTER_KEY_B64, clientSecret, 'client', userId)
+    : null;
+
+  await c.env.DB.prepare(
+    `UPDATE users
+        SET client_id_enc = ?1, client_secret_enc = ?2, client_type = ?3, redirect_uri = ?4,
+            tokens_enc = NULL, tokens_prev_enc = NULL, expires_at = NULL,
+            status = 'pending', reauth_url = NULL, refresh_fail_count = 0,
+            updated_at = ?5
+      WHERE user_id = ?6`,
+  )
+    .bind(clientIdEnc, clientSecretEnc, clientType, redirectUri, now(), userId)
+    .run();
+
+  await audit(c.env, {
+    userId,
+    route: 'admin/x-credentials',
+    via: 'admin',
+    code: 'credentials_replaced',
+  });
+
+  return c.json({
+    ok: true,
+    userId,
+    clientType,
+    redirectUri,
+    status: 'pending',
+    authorizeUrl: `${c.env.RELAY_BASE_URL}/x/oauth/start?user=${encodeURIComponent(userId)}`,
+    note: 'Tokens were cleared because they belonged to the previous client. Re-authorize via authorizeUrl.',
+  });
+});
+
+/**
  * Ground truth for what actually reached the relay.
  *
  * This exists because a Mind will sometimes answer from conversation context instead of
