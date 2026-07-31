@@ -1,0 +1,19 @@
+{
+  // The ops layer runs in local Node, not on the edge, so it needs Node globals rather
+  // than workers-types. Kept separate because the two global sets conflict.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["ops/**/*.ts"]
+}

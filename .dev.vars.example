@@ -1,0 +1,9 @@
+# Copy to .dev.vars for `wrangler dev`. Never commit .dev.vars.
+# Generate MASTER_KEY_B64:  openssl rand -base64 32
+MASTER_KEY_B64=
+# Optional: decrypt-only previous master key, for rotation without downtime
+MASTER_KEY_B64_PREV=
+# Admin API key for /admin/* routes:  openssl rand -hex 32
+ADMIN_KEY=
+# HMAC key signing the human approval links:  openssl rand -hex 32
+APPROVAL_HMAC_KEY=

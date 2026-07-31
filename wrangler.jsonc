@@ -1,0 +1,47 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "x-relay",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Short-lived PKCE state only. Native expirationTtl + delete-on-first-use gives
+  // replay protection for free.
+  "kv_namespaces": [
+    {
+      "binding": "PKCE",
+      // Local dev works with this placeholder. For remote:
+      //   npx wrangler kv namespace create PKCE   -> paste the returned id here
+      "id": "local-placeholder-pkce"
+    }
+  ],
+
+  // Everything durable. Strongly consistent, because X invalidates a refresh token
+  // the moment it is used and a stale read loses the account permanently.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "x-relay",
+      // Local dev works with this placeholder. For remote:
+      //   npx wrangler d1 create x-relay   -> paste the returned database_id here
+      "database_id": "local-placeholder-d1"
+    }
+  ],
+
+  // Token health sweep. Keeps /x/post off the refresh path, which matters because
+  // HTTP_Execute's timeout budget is undocumented.
+  "triggers": { "crons": ["*/15 * * * *"] },
+
+  "vars": {
+    "PAYMENTS_ENABLED": "false",
+    "RELAY_BASE_URL": "http://127.0.0.1:8787",
+    "RELAY_VERSION": "0.1.0"
+  }
+
+  // Secrets are NOT here. Set via `wrangler secret put`:
+  //   MASTER_KEY_B64        openssl rand -base64 32
+  //   ADMIN_KEY             openssl rand -hex 32
+  //   APPROVAL_HMAC_KEY     openssl rand -hex 32
+  // Optional: MASTER_KEY_B64_PREV (decrypt-only, for master-key rotation)
+}
