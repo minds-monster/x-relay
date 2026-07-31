@@ -13,7 +13,7 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../lib/auth.ts';
 import { requireRelayKey } from '../lib/auth.ts';
 import { hmacHex, sha256Hex } from '../lib/crypto.ts';
-import { addSpend, audit, getPostByIdem } from '../lib/db.ts';
+import { addSpend, audit } from '../lib/db.ts';
 import { RelayError, badRequest } from '../lib/errors.ts';
 import {
   checkQuotas,
@@ -260,8 +260,20 @@ export async function sendNow(
   try {
     ({ accessToken } = await getFreshAccessToken(c.env, user));
   } catch (err) {
-    await markFailed(c.env, postId, 'token', err instanceof Error ? err.message : String(err));
+    const code = err instanceof RelayError ? err.code : 'x_upstream_error';
+    const msg = err instanceof Error ? err.message : String(err);
+    await markFailed(c.env, postId, code, msg);
     await releaseFailedClaim(c.env, postId);
+    // Audit here too: the audit table is the ground truth for "did this request happen",
+    // so a request that dies before reaching X must still leave a trace.
+    await audit(c.env, {
+      userId: user.user_id,
+      route: 'x/post',
+      via,
+      code,
+      httpStatus: err instanceof RelayError ? err.httpStatus : 502,
+      detail: msg,
+    });
     throw err;
   }
 
