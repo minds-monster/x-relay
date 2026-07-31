@@ -25,8 +25,8 @@
  * Usage:
  *   npm run ops -- ops/daily-loop.ts [--dry-run] [--topic "..."] [--yes]
  */
-import { readFileSync } from 'node:fs';
 import { ask, client, MIND_ID, resolveOpsAlias, errText } from './minds.ts';
+import { findNonceInAudit, relayFetch, relayKey, resolveCallBase } from './relay-client.ts';
 
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
@@ -38,26 +38,6 @@ const topic =
 const MIN_COGNITION_BALANCE = 1;
 
 const today = new Date().toISOString().slice(0, 10);
-
-function requireEnv(name: string): string {
-  const v = process.env[name];
-  if (!v) {
-    console.error(`${name} is not set in .env — required now that this script posts directly.`);
-    process.exit(2);
-  }
-  return v;
-}
-
-const baseUrl = requireEnv('RELAY_BASE_URL').replace(/\/$/, '');
-
-function relayKey(): string {
-  try {
-    return readFileSync(new URL('../.relay-key', import.meta.url), 'utf8').trim();
-  } catch {
-    console.error('No .relay-key file. Run: sh ops/relay.sh provision <clientId> <clientSecret>');
-    process.exit(2);
-  }
-}
 
 /**
  * Random per-run token. Proves the specific call happened: the value cannot have been
@@ -227,16 +207,12 @@ console.log(`  chars   : ${[...draftText].length} (Mind said ${claimedChars})`);
 // 2. Post it ourselves. This is the step that must not be skippable.
 // ---------------------------------------------------------------------------
 
-const body = {
-  text: draftText,
-  idempotencyKey: `daily-${today}`,
-  clientNonce: nonce,
-  dryRun,
-};
+let status: number;
+let ok: boolean;
+let out: Record<string, any>;
 
-let res: Response;
 try {
-  res = await fetch(`${baseUrl}/x/post`, {
+  ({ status, ok, body: out } = await relayFetch('/x/post', {
     method: 'POST',
     headers: {
       authorization: `Bearer ${relayKey()}`,
@@ -244,19 +220,22 @@ try {
       // Marks provenance in the audit log: this call came from the scheduled loop.
       'x-relay-via': 'cron',
     },
-    body: JSON.stringify(body),
-  });
+    body: JSON.stringify({
+      text: draftText,
+      idempotencyKey: `daily-${today}`,
+      clientNonce: nonce,
+      dryRun,
+    }),
+  }));
 } catch (err) {
-  console.error(`\n  Could not reach the relay at ${baseUrl}: ${errText(err)}`);
-  console.error('  Is `npx wrangler dev` running, and is RELAY_BASE_URL correct?');
+  console.error(`\n  ${errText(err)}`);
+  console.error('  The draft above was NOT posted. Re-run to try again.');
   process.exit(1);
 }
 
-const out = (await res.json().catch(() => ({}))) as Record<string, any>;
+console.log(`  posted  : http ${status} (via ${await resolveCallBase()})`);
 
-console.log(`  posted  : http ${res.status}`);
-
-if (!res.ok && !out.ok) {
+if (!ok && !out.ok) {
   console.error(`  ERROR   : ${out.error?.code ?? 'unknown'} — ${out.error?.message ?? ''}`);
   process.exit(1);
 }
@@ -276,38 +255,26 @@ if (out.dryRun) {
 // 3. Confirm the relay recorded THIS call, by nonce.
 // ---------------------------------------------------------------------------
 
-const adminKey = process.env.ADMIN_KEY;
 const userId = process.env.RELAY_USER_ID ?? 'adam';
 
-if (!adminKey) {
+if (!process.env.ADMIN_KEY) {
   console.log('\n  (set ADMIN_KEY in .env to verify server-side)');
 } else {
   const sinceSec = Math.ceil((Date.now() - startedAt) / 1000) + 60;
   try {
-    const vres = await fetch(
-      `${baseUrl}/admin/users/${encodeURIComponent(userId)}/recent?sinceSec=${sinceSec}`,
-      { headers: { 'x-admin-key': adminKey } },
-    );
-    if (!vres.ok) {
-      console.warn(`\n  (could not verify: relay returned ${vres.status})`);
-    } else {
-      const vbody = (await vres.json()) as { audit?: Array<Record<string, unknown>> };
-      const match = (vbody.audit ?? []).find(
-        (row) => String(row.route) === 'x/post' && String(row.detail ?? '').includes(`nonce=${nonce}`),
+    const match = await findNonceInAudit(userId, nonce, sinceSec);
+    if (match) {
+      console.log(
+        `\n  verified: relay recorded this exact call (nonce=${nonce}, via=${match.via}, code=${match.code})`,
       );
-      if (match) {
-        console.log(
-          `\n  verified: relay recorded this exact call (nonce=${nonce}, via=${match.via}, code=${match.code})`,
-        );
-      } else {
-        // With the post performed by this script, this should be unreachable. If it
-        // fires, suspect the relay rather than the Mind.
-        console.error(
-          `\n  verified: NO audit row carrying nonce=${nonce}\n` +
-            '  The relay answered but did not record the call. Check the Worker logs.',
-        );
-        process.exit(1);
-      }
+    } else {
+      // With the post performed by this script rather than the Mind, this should be
+      // unreachable. If it fires, suspect the relay, not the Mind.
+      console.error(
+        `\n  verified: NO audit row carrying nonce=${nonce}\n` +
+          '  The relay answered but did not record the call. Check the Worker logs.',
+      );
+      process.exit(1);
     }
   } catch (err) {
     console.warn(`\n  (could not verify: ${errText(err)})`);

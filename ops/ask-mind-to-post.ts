@@ -17,6 +17,7 @@
  *   npm run ops -- ops/ask-mind-to-post.ts --status
  */
 import { ask, resolveOpsAlias, errText } from './minds.ts';
+import { relayFetch } from './relay-client.ts';
 
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
@@ -108,8 +109,6 @@ if (String(parsed.requestId ?? '') !== nonce) {
   );
 }
 
-const baseUrl = process.env.RELAY_BASE_URL?.replace(/\/$/, '');
-const adminKey = process.env.ADMIN_KEY;
 const userId = process.env.RELAY_USER_ID ?? 'adam';
 
 if (statusOnly) {
@@ -118,24 +117,25 @@ if (statusOnly) {
   process.exit(0);
 }
 
-if (!baseUrl || !adminKey) {
-  console.log('\n  (set RELAY_BASE_URL and ADMIN_KEY in .env to verify server-side)');
+if (!process.env.ADMIN_KEY) {
+  console.log('\n  (set ADMIN_KEY in .env to verify server-side)');
   process.exit(0);
 }
 
 const sinceSec = Math.ceil((Date.now() - startedAt) / 1000) + 60;
 
 try {
-  const res = await fetch(
-    `${baseUrl}/admin/users/${encodeURIComponent(userId)}/recent?sinceSec=${sinceSec}`,
-    { headers: { 'x-admin-key': adminKey } },
+  const { ok, body } = await relayFetch(
+    `/admin/users/${encodeURIComponent(userId)}/recent?sinceSec=${sinceSec}`,
+    { headers: { 'x-admin-key': process.env.ADMIN_KEY } },
   );
-  if (!res.ok) {
-    console.warn(`\n  (could not verify: relay returned ${res.status})`);
+  if (!ok) {
+    console.warn('\n  (could not verify: relay rejected the admin request)');
     process.exit(0);
   }
-  const body = (await res.json()) as { audit?: Array<Record<string, unknown>> };
-  const rows = (body.audit ?? []).filter((r) => String(r.route) === 'x/post');
+  const rows = ((body.audit ?? []) as Array<Record<string, unknown>>).filter(
+    (r) => String(r.route) === 'x/post',
+  );
   const match = rows.find((r) => String(r.detail ?? '').includes(`nonce=${nonce}`));
 
   console.log('\n--- server-side verification ---');
