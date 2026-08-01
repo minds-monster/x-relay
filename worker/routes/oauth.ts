@@ -12,26 +12,12 @@ import { audit, getUser, now } from '../lib/db.ts';
 import { badRequest, notFound, RelayError } from '../lib/errors.ts';
 import { readClientCreds, persistTokens } from '../lib/tokens.ts';
 import { buildAuthorizeUrl, exchangeCode, getMe, toEnvelope, X_SCOPES } from '../lib/xclient.ts';
+import { escapeHtml, page } from '../lib/html.ts';
 import type { PkceState } from '../types.ts';
 
 export const oauth = new Hono<AppEnv>();
 
 const PKCE_TTL_SEC = 600;
-
-function page(title: string, bodyHtml: string, status = 200): Response {
-  return new Response(
-    `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title}</title>
-<style>
- body{font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:34rem;margin:6rem auto;padding:0 1.5rem;color:#111}
- code{background:#f4f4f5;padding:.15em .4em;border-radius:4px;font-size:.9em}
- .ok{color:#0a7d32}.bad{color:#b3261e}
- h1{font-size:1.35rem;margin-bottom:.5rem}
-</style>
-${bodyHtml}`,
-    { status, headers: { 'content-type': 'text/html; charset=utf-8' } },
-  );
-}
 
 oauth.get('/x/oauth/start', async (c) => {
   const userId = c.req.query('user');
@@ -185,12 +171,3 @@ oauth.get('/x/oauth/callback', async (c) => {
     );
   }
 });
-
-export function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}

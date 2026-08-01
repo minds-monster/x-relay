@@ -50,6 +50,39 @@ export interface UserRow {
   budget_usd_month: number;
   spend_usd_month: number;
   spend_month: string | null;
+  /** JSON array of UTC "HH:MM" strings. Read it through parseSlots() in lib/schedule.ts. */
+  slots_utc: string | null;
+  hold_sec: number;
+  queue_ttl_sec: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export type QueueStatus =
+  | 'queued'
+  | 'held'
+  | 'posted'
+  | 'vetoed'
+  | 'expired'
+  | 'failed'
+  | 'withdrawn';
+
+export interface QueueRow {
+  id: number;
+  user_id: string;
+  submission_id: string;
+  source: string | null;
+  text: string;
+  text_sha256: string;
+  has_url: number;
+  allow_url: number;
+  priority: number;
+  status: QueueStatus;
+  slot_id: string | null;
+  hold_until: number | null;
+  expires_at: number;
+  post_id: number | null;
+  error_code: string | null;
   created_at: number;
   updated_at: number;
 }

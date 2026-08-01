@@ -15,27 +15,30 @@ import { markDone, markFailed, tweetUrl } from '../lib/idempotency.ts';
 import { addSpend } from '../lib/db.ts';
 import { getFreshAccessToken } from '../lib/tokens.ts';
 import { createPost } from '../lib/xclient.ts';
-import { escapeHtml } from './oauth.ts';
+import { escapeHtml, page as shell } from '../lib/html.ts';
+import { setStatus } from '../lib/queue.ts';
 
 export const approve = new Hono<AppEnv>();
 
-function shell(title: string, inner: string, status = 200): Response {
-  return new Response(
-    `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title}</title>
-<style>
- body{font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:36rem;margin:4rem auto;padding:0 1.5rem;color:#111}
- .draft{border:1px solid #e4e4e7;border-left:3px solid #71717a;border-radius:6px;padding:1rem 1.15rem;margin:1.25rem 0;white-space:pre-wrap;background:#fafafa}
- .meta{color:#71717a;font-size:.85rem;margin-bottom:1.5rem}
- button{font:inherit;padding:.6rem 1.4rem;border-radius:6px;border:1px solid transparent;cursor:pointer;margin-right:.6rem}
- .go{background:#111;color:#fff}.no{background:#fff;color:#b3261e;border-color:#e4e4e7}
- code{background:#f4f4f5;padding:.15em .4em;border-radius:4px;font-size:.9em}
- .ok{color:#0a7d32}.bad{color:#b3261e}
- h1{font-size:1.3rem}
-</style>
-${inner}`,
-    { status, headers: { 'content-type': 'text/html; charset=utf-8' } },
-  );
+/**
+ * Keep the queue row in step when a draft it created is approved or rejected here.
+ *
+ * Without this a queued draft that went down the approval path would sit at `held`
+ * forever, occupying its slot and never being reported as resolved. Best-effort: the
+ * post itself is the outcome that matters.
+ */
+async function syncQueueRow(
+  env: AppEnv['Bindings'],
+  postId: number,
+  status: 'posted' | 'vetoed' | 'failed',
+  errorCode?: string,
+): Promise<void> {
+  const row = await env.DB.prepare(
+    `SELECT id FROM queue WHERE post_id = ?1 AND status = 'held' LIMIT 1`,
+  )
+    .bind(postId)
+    .first<{ id: number }>();
+  if (row) await setStatus(env, row.id, status, { errorCode: errorCode ?? null });
 }
 
 async function verifyOrThrow(c: { env: AppEnv['Bindings'] }, postId: string, token: string | undefined) {
@@ -103,6 +106,7 @@ approve.post('/approve/:id', async (c) => {
     )
       .bind(now(), row.id)
       .run();
+    await syncQueueRow(c.env, row.id, 'vetoed');
     await audit(c.env, { userId: row.user_id, route: 'approve', via: 'approval', code: 'rejected', httpStatus: 200 });
     return shell('Rejected', '<h1>Rejected</h1><p>Nothing was posted.</p>');
   }
@@ -117,6 +121,7 @@ approve.post('/approve/:id', async (c) => {
     const result = await createPost({ accessToken, text: row.text });
     await markDone(c.env, row.id, result.tweetId, result.raw, cost);
     await addSpend(c.env, user.user_id, cost);
+    await syncQueueRow(c.env, row.id, 'posted');
     await audit(c.env, {
       userId: user.user_id,
       route: 'approve',
@@ -134,6 +139,7 @@ approve.post('/approve/:id', async (c) => {
     const code = err instanceof RelayError ? err.code : 'x_upstream_error';
     const msg = err instanceof Error ? err.message : String(err);
     await markFailed(c.env, row.id, code, msg);
+    await syncQueueRow(c.env, row.id, 'failed', code);
     await audit(c.env, {
       userId: user.user_id,
       route: 'approve',

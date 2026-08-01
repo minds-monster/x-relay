@@ -121,11 +121,19 @@ export async function relayFetch(
   );
 }
 
-/** Look for an audit row carrying our nonce — proof the call really happened. */
+/**
+ * Look for an audit row carrying our nonce — proof the call really happened.
+ *
+ * A missing row is ambiguous: the request may simply have failed. A row carrying a value
+ * that did not exist before this run began is not ambiguous, which is the whole point.
+ *
+ * `route` defaults to the posting route; pass 'x/queue' when verifying a submission.
+ */
 export async function findNonceInAudit(
   userId: string,
   nonce: string,
   sinceSec: number,
+  route = 'x/post',
 ): Promise<Record<string, unknown> | null> {
   const adminKey = process.env.ADMIN_KEY;
   if (!adminKey) return null;
@@ -139,7 +147,7 @@ export async function findNonceInAudit(
   const rows = (body.audit ?? []) as Array<Record<string, unknown>>;
   return (
     rows.find(
-      (r) => String(r.route) === 'x/post' && String(r.detail ?? '').includes(`nonce=${nonce}`),
+      (r) => String(r.route) === route && String(r.detail ?? '').includes(`nonce=${nonce}`),
     ) ?? null
   );
 }

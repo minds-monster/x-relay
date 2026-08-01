@@ -1,5 +1,18 @@
 # Testing guide
 
+> **This guide describes the LOCAL bring-up**, from an empty machine to a real tweet, via
+> an ngrok tunnel. It is still the right way to test changes before deploying, and the
+> right way to stand the relay up somewhere new.
+>
+> **The relay is already deployed** at https://relay.minds.monster. To test against
+> production, skip to [Phase E](#phase-e--the-queue-and-the-scheduler) and use
+> `RELAY_ENV=prod`; you do not need the tunnel, the OAuth steps, or a second X app.
+>
+> One thing local testing **cannot** cover: `wrangler dev` does not fire cron triggers, so
+> the scheduler never runs locally. Slot logic is covered by `test/schedule.test.ts` and
+> `test/queue.test.ts`; the timer itself can only be watched with `wrangler tail` against
+> the deployed Worker.
+
 Follow this top to bottom. Every step says exactly what to type, exactly what you should
 see, and what to do if you see something else.
 
@@ -526,16 +539,16 @@ it dies.
 ### Step 28 — the content loop
 
 ```bash
-npm run ops -- ops/daily-loop.ts --dry-run
-npm run ops -- ops/daily-loop.ts --topic "your topic here"
+npm run ops -- ops/submit-draft.ts --dry-run
+npm run ops -- ops/submit-draft.ts --topic "your topic here"
 ```
 
 **How this one is built, because it differs from Step 26 on purpose.** The Mind only
-*writes* the post; this script performs the HTTP call itself. An earlier version asked the
-Mind to do both, and it replayed a previous answer verbatim — reporting `dry_run` on a run
-that never requested one — without calling the relay at all. Prompting does not reliably
-fix an agent that skips a side effect and reports success, so the side effect now lives in
-code that cannot skip it.
+*writes* the post; this script hands the text to the relay's queue and the Worker's cron
+publishes it later. An earlier version asked the Mind to do both, and it replayed a
+previous answer verbatim — reporting `dry_run` on a run that never requested one — without
+calling the relay at all. Prompting does not reliably fix an agent that skips a side effect
+and reports success, so the side effect lives somewhere that cannot skip it.
 
 Two safeguards you'll see in the output:
 
@@ -551,16 +564,139 @@ removes the history there is to replay from. You'll see `attempt 2 (fresh conver
 Expect:
 
 ```
-  attempt 1 (primary) -> relay:x-daily-2026-07-31
+  attempt 1 (primary) -> relay:x-daily-2026-08-01
   request id: n7ys8j9ab33ym
   draft   : Your slowest pages reveal agents first. Humans bounce; agents wait...
   chars   : 129 (Mind said 129)
-  posted  : http 202
-  APPROVE : https://.../approve/14?t=...
-  verified: relay recorded this exact call (nonce=n7ys8j9ab33ym, via=cron, code=dry_run)
+  queued  : http 201
+  queueId : #4 (position 1)
+  slot    : 2026-08-01T13:00:00.000Z
+  verified: relay recorded this exact submission (nonce=n7ys8j9ab33ym, via=cron, code=queued)
 ```
 
-`via=cron` is correct here — this script, not the Mind, made the call.
+`via=cron` is correct here — this script, not the Mind, made the call. Nothing is live
+yet: the relay will hold it, announce it, and post it at the slot shown.
+
+---
+
+# Phase E — the queue and the scheduler
+
+This is the part that makes the relay unattended, and the only part that must be verified
+against the **deployed** Worker — `wrangler dev` does not fire cron triggers.
+
+```bash
+export RELAY_ENV=prod     # config from .env.prod, D1 queries --remote
+```
+
+## Step 29 — the schedule
+
+```bash
+sh ops/relay.sh slots
+```
+
+Expect a finite list of UTC times, a hold window, and the rolling-24h ceiling shown
+separately and labelled as *not* the schedule. Those two are different things and the
+distinction is deliberate — see STATUS.md §4.
+
+Check the validation refuses a schedule it could not honour:
+
+```bash
+sh ops/relay.sh slots 13:00 13:30      # with minIntervalSec 3600
+```
+
+Expect a `relay_bad_request` naming both slots and the arithmetic, **and the stored
+schedule unchanged** — validation happens before the write.
+
+## Step 30 — submit, list, withdraw
+
+```bash
+sh ops/relay.sh submit "a distinct sentence $(date +%s)"
+sh ops/relay.sh queue
+```
+
+Expect a `queueId`, a `position`, and a concrete `estimatedSlotUtc`. Submit a second draft
+and confirm it is offered the *next* slot, not the same one — that is the §7.2 fix visible
+from outside.
+
+Now prove the submission is idempotent:
+
+```bash
+sh ops/relay.sh submit "fixed text for the idempotency check" probe-1
+sh ops/relay.sh submit "fixed text for the idempotency check" probe-1
+```
+
+The second returns `"idempotent": true` with the *same* `queueId` and enqueues nothing.
+
+Guardrails run at submit time so a Mind is told immediately rather than discovering it
+from a log hours later:
+
+| Try | Expect |
+|---|---|
+| the same text again with a new submissionId | `duplicate_recent_text` |
+| `"look at https://example.com"` | `url_not_allowed` — the 13× cost cliff is opt-in |
+| 300 characters | `text_too_long` |
+
+Clean up anything you do not actually want published:
+
+```bash
+sh ops/relay.sh unqueue <queueId>
+```
+
+**Do this before the next slot.** A smoke-test draft left in the queue will be posted for
+real, to a real audience.
+
+## Step 31 — a slot firing, end to end
+
+Set a slot a few minutes out with a short hold window, so you do not wait an hour:
+
+```bash
+sh ops/relay.sh hold 60
+sh ops/relay.sh slots <the next 5-minute boundary, UTC>
+sh ops/relay.sh submit "something you are content to publish"
+npx wrangler tail
+```
+
+Watch for, in this order:
+
+1. `[scheduler] bound=1 ...` — the draft is bound to the slot and **held**, not sent.
+2. A Slack alert with the draft text and a **Stop it** link.
+3. At the slot: `[scheduler] ... posted=1`.
+4. `sh ops/relay.sh audit` shows `via=cron code=posted`.
+
+The order matters and is enforced: bind-and-hold always runs a tick before dispatch, so a
+draft can never be bound and published within the same tick — the alert always reaches you
+first. See STATUS.md §8.2b.
+
+## Step 32 — the veto path
+
+Submit another draft, wait for the alert, then click **Stop it** during the hold window.
+
+Expect: a confirmation page, nothing posted, and the slot left **empty**. The next draft
+waits for the next slot rather than being pulled forward — substituting content into a
+slot you just rejected would defeat the point of the window.
+
+Check the link is not guessable:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://relay.minds.monster/queue/1/veto
+curl -s -o /dev/null -w "%{http_code}\n" "https://relay.minds.monster/queue/1/veto?t=deadbeef"
+```
+
+Both should be `403`.
+
+## Step 33 — two posts in one day
+
+The original blocker. With two slots configured and two drafts queued, both should go live,
+and `sh ops/relay.sh posts` should show two rows with **different** `slot:` idempotency
+keys. Under the old `daily-<date>` key the second returned "already posted today".
+
+## Step 34 — restore
+
+```bash
+sh ops/relay.sh hold 1800
+sh ops/relay.sh slots 13:00 17:00 21:00
+sh ops/relay.sh queue     # confirm empty before you walk away
+```
 
 ---
 
@@ -577,10 +713,14 @@ Expect:
 | `x_credits_exhausted` | No prepaid credits on the X developer account |
 | `url_not_allowed` | Working as designed. Add `allowUrl` only if you really want the $0.20 post |
 | `min_interval_not_elapsed` | One post/hour by default. `sh ops/relay.sh set '{"minIntervalSec":0}'` |
-| `daily_cap_reached` | Three/day by default. `sh ops/relay.sh set '{"dailyCap":10}'` |
-| `duplicate_recent_text` | You already posted that exact text in the last 7 days. X bans duplicates — change the wording |
+| `daily_cap_reached` | The rolling-24h ceiling, not the schedule. `sh ops/relay.sh set '{"dailyCap":10}'` |
+| `duplicate_recent_text` | You already posted or queued that exact text. X bans duplicates — change the wording |
 | Mind claims success, no tweet | `sh ops/relay.sh audit`. No `via=mind` row means it never called |
 | Mind uses `127.0.0.1` | `RELAY_BASE_URL` was stale at step 18. Redo steps 16 and 18 |
+| `no_schedule_configured` | No slots set, so a queued draft would never go out. `sh ops/relay.sh slots 13:00 17:00` |
+| `queue_full` | The backlog exceeds what the schedule drains before drafts expire. Let it clear |
+| Drafts queue but never post | The cron trigger. `npx wrangler tail` — no `[scheduler]` line every 5 min means it is unregistered. See STATUS.md §2.1 |
+| `audit` looks empty after deploying | You forgot `RELAY_ENV=prod`, so you are reading the local database. The direct-SQL commands print their target |
 
 Handy inspection commands:
 
@@ -602,7 +742,10 @@ rm -f .relay-key
 
 # When you're finished testing
 
-- Disable the diagnostic echo route: set `DEBUG_ECHO_ENABLED=false` in `.dev.vars`.
-- The ngrok URL dies when Terminal 3 closes. For a permanent URL, deploy to Cloudflare —
-  needs `npx wrangler login`, then the remote D1/KV and secret steps in
-  [README.md](README.md).
+- **Empty the queue.** `sh ops/relay.sh queue` — anything left will be published for real
+  at its slot. This is the easiest way to leak a test post to a live audience.
+- Restore the real schedule and hold window if you shortened them (Step 34).
+- Disable the diagnostic echo route locally: set `DEBUG_ECHO_ENABLED=false` in `.dev.vars`.
+  It is already off in production.
+- The ngrok URL dies when Terminal 3 closes. Production does not depend on it —
+  https://relay.minds.monster is a custom domain on Cloudflare.

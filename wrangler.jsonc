@@ -3,9 +3,12 @@
   "name": "x-relay",
   "main": "worker/index.ts",
   "compatibility_date": "2026-07-01",
-  "compatibility_flags": ["nodejs_compat"],
-  "observability": { "enabled": true },
-
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "observability": {
+    "enabled": true
+  },
   // Short-lived PKCE state only. Native expirationTtl + delete-on-first-use gives
   // replay protection for free.
   "kv_namespaces": [
@@ -13,10 +16,9 @@
       "binding": "PKCE",
       // Local dev works with this placeholder. For remote:
       //   npx wrangler kv namespace create PKCE   -> paste the returned id here
-      "id": "local-placeholder-pkce"
+      "id": "a038d3753db141ffb232f5bc444eaafd"
     }
   ],
-
   // Everything durable. Strongly consistent, because X invalidates a refresh token
   // the moment it is used and a stale read loses the account permanently.
   "d1_databases": [
@@ -25,20 +27,34 @@
       "database_name": "x-relay",
       // Local dev works with this placeholder. For remote:
       //   npx wrangler d1 create x-relay   -> paste the returned database_id here
-      "database_id": "local-placeholder-d1"
+      "database_id": "12cff7ee-2740-4159-b624-f8ce3c3e835f"
     }
   ],
-
-  // Token health sweep. Keeps /x/post off the refresh path, which matters because
-  // HTTP_Execute's timeout budget is undocumented.
-  "triggers": { "crons": ["*/15 * * * *"] },
-
+  // Every 5 minutes: token health sweep, then the posting schedule.
+  //
+  // 5 rather than 15 because this now drives publishing, and the interval bounds two
+  // things: how precisely a slot can be hit, and how long a draft's hold window can be
+  // undershot. Ticks are assumed unreliable — Cloudflare may skip, delay or overlap one —
+  // so every operation the scheduler performs is idempotent.
+  "triggers": {
+    "crons": [
+      "*/5 * * * *"
+    ]
+  },
   "vars": {
     "PAYMENTS_ENABLED": "false",
-    "RELAY_BASE_URL": "http://127.0.0.1:8787",
-    "RELAY_VERSION": "0.1.0"
-  }
-
+    "RELAY_BASE_URL": "https://relay.minds.monster",
+    "RELAY_VERSION": "0.2.0",
+    // /debug/echo is unauthenticated by necessity — it measures how a caller's auth
+    // headers arrive. It answered the HTTP_Execute question; it stays closed now.
+    "DEBUG_ECHO_ENABLED": "false"
+  },
+  "routes": [
+    {
+      "pattern": "relay.minds.monster",
+      "custom_domain": true
+    }
+  ]
   // Secrets are NOT here. Set via `wrangler secret put`:
   //   MASTER_KEY_B64        openssl rand -base64 32
   //   ADMIN_KEY             openssl rand -hex 32

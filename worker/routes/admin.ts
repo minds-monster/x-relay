@@ -12,6 +12,7 @@ import { encryptForUser } from '../lib/crypto.ts';
 import { audit, getUser, now } from '../lib/db.ts';
 import { RelayError, badRequest, notFound } from '../lib/errors.ts';
 import { assertClientType } from '../lib/xclient.ts';
+import { normalizeSlots, parseSlots, validateSlots, ScheduleError } from '../lib/schedule.ts';
 import type { ClientType } from '../types.ts';
 
 export const admin = new Hono<AppEnv>();
@@ -146,13 +147,101 @@ admin.get('/admin/users/:id', async (c) => {
       tokenExpiresAt: user.expires_at ? new Date(user.expires_at * 1000).toISOString() : null,
       refreshFailCount: user.refresh_fail_count,
       requireApproval: Boolean(user.require_approval),
+
+      // The schedule: when posts go out.
+      slotsUtc: parseSlots(user.slots_utc),
+      holdSec: user.hold_sec,
+      queueTtlSec: user.queue_ttl_sec,
+
+      // A rolling-24h ceiling, not the schedule. Both names are shown so the distinction
+      // is visible wherever this record is read.
+      rate24hCap: user.daily_cap,
       dailyCap: user.daily_cap,
+
       minIntervalSec: user.min_interval_sec,
       budgetUsdMonth: user.budget_usd_month,
       spendUsdMonth: user.spend_usd_month,
       reauthUrl: user.reauth_url,
     },
   });
+});
+
+/**
+ * Mint an ADDITIONAL relay key, leaving existing ones alone.
+ *
+ * One key per content Mind. `rotate-key` deliberately expires its siblings — that is what
+ * makes rotation meaningful — but that is the wrong tool for adding a caller: revoking a
+ * single misbehaving Mind should not take every other Mind offline with it.
+ */
+admin.post('/admin/users/:id/keys', async (c) => {
+  const userId = c.req.param('id');
+  const user = await getUser(c.env, userId);
+  if (!user) throw notFound(`No such user: ${userId}`);
+
+  const body = (await c.req.json().catch(() => ({}))) as { label?: string };
+
+  const isProd = !c.env.RELAY_BASE_URL.includes('127.0.0.1') && !c.env.RELAY_BASE_URL.includes('localhost');
+  const { key, keyId } = mintRelayKey(isProd);
+  await insertRelayKey(c.env, userId, key, keyId);
+
+  await audit(c.env, {
+    userId,
+    route: 'admin/keys',
+    via: 'admin',
+    code: 'key_added',
+    detail: body.label?.slice(0, 64) ?? null,
+  });
+
+  return c.json(
+    {
+      ok: true,
+      userId,
+      keyId,
+      // Shown exactly once. Only sha256(key) is stored.
+      relayKey: key,
+      label: body.label ?? null,
+      note: 'Give this to exactly one caller. Revoking it will not affect the others.',
+    },
+    201,
+  );
+});
+
+admin.get('/admin/users/:id/keys', async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT key_id, created_at, revoked_at, expires_at FROM relay_keys
+      WHERE user_id = ?1 ORDER BY created_at DESC`,
+  )
+    .bind(c.req.param('id'))
+    .all();
+
+  return c.json({
+    ok: true,
+    keys: (results ?? []).map((r: any) => ({
+      keyId: r.key_id,
+      createdAt: new Date(r.created_at * 1000).toISOString(),
+      revokedAt: r.revoked_at ? new Date(r.revoked_at * 1000).toISOString() : null,
+      expiresAt: r.expires_at ? new Date(r.expires_at * 1000).toISOString() : null,
+      active: !r.revoked_at && (!r.expires_at || r.expires_at > now()),
+    })),
+  });
+});
+
+/** Revoke one key immediately. No grace window: revocation is for when you mean it. */
+admin.delete('/admin/users/:id/keys/:keyId', async (c) => {
+  const userId = c.req.param('id');
+  const keyId = c.req.param('keyId');
+
+  const res = await c.env.DB.prepare(
+    `UPDATE relay_keys SET revoked_at = ?1
+      WHERE user_id = ?2 AND key_id = ?3 AND revoked_at IS NULL`,
+  )
+    .bind(now(), userId, keyId)
+    .run();
+
+  if ((res.meta.changes ?? 0) === 0) throw notFound(`No active key ${keyId} for ${userId}.`);
+
+  await audit(c.env, { userId, route: 'admin/keys', via: 'admin', code: 'key_revoked', detail: keyId });
+  return c.json({ ok: true, userId, keyId, revoked: true });
 });
 
 /**
@@ -273,6 +362,9 @@ interface PatchUserBody {
   minIntervalSec?: number;
   budgetUsdMonth?: number;
   status?: string;
+  slotsUtc?: unknown[];
+  holdSec?: number;
+  queueTtlSec?: number;
 }
 
 admin.patch('/admin/users/:id', async (c) => {
@@ -283,6 +375,49 @@ admin.patch('/admin/users/:id', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as PatchUserBody;
   const sets: string[] = [];
   const vals: unknown[] = [];
+
+  // Validate the schedule against whichever minInterval will be in force after this
+  // request, not the one currently stored — otherwise setting both in a single call
+  // checks the new slots against the old interval and can accept a schedule that is
+  // guaranteed to fail at dispatch.
+  const effectiveInterval = body.minIntervalSec ?? user.min_interval_sec;
+
+  if (body.slotsUtc !== undefined) {
+    if (!Array.isArray(body.slotsUtc)) throw badRequest('slotsUtc must be an array of "HH:MM" strings.');
+    try {
+      const slots = normalizeSlots(body.slotsUtc);
+      validateSlots(slots, effectiveInterval);
+      sets.push(`slots_utc = ?${sets.length + 1}`);
+      vals.push(JSON.stringify(slots));
+    } catch (err) {
+      if (err instanceof ScheduleError) throw badRequest(err.message);
+      throw err;
+    }
+  } else if (body.minIntervalSec !== undefined) {
+    // Widening the interval can invalidate a schedule that was fine before.
+    try {
+      validateSlots(parseSlots(user.slots_utc), effectiveInterval);
+    } catch (err) {
+      if (err instanceof ScheduleError) throw badRequest(err.message);
+      throw err;
+    }
+  }
+
+  if (body.holdSec !== undefined) {
+    if (!Number.isFinite(body.holdSec) || body.holdSec < 0) {
+      throw badRequest('holdSec must be a non-negative number of seconds.');
+    }
+    sets.push(`hold_sec = ?${sets.length + 1}`);
+    vals.push(Math.trunc(body.holdSec));
+  }
+
+  if (body.queueTtlSec !== undefined) {
+    if (!Number.isFinite(body.queueTtlSec) || body.queueTtlSec <= 0) {
+      throw badRequest('queueTtlSec must be a positive number of seconds.');
+    }
+    sets.push(`queue_ttl_sec = ?${sets.length + 1}`);
+    vals.push(Math.trunc(body.queueTtlSec));
+  }
 
   if (body.requireApproval !== undefined) {
     sets.push(`require_approval = ?${sets.length + 1}`);

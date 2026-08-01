@@ -22,6 +22,10 @@ export type ErrorCode =
   | 'budget_exceeded'
   | 'duplicate_recent_text'
   | 'post_in_flight'
+  // queue
+  | 'submission_id_required'
+  | 'no_schedule_configured'
+  | 'queue_full'
   // account state
   | 'x_reauth_required'
   | 'x_client_invalid'

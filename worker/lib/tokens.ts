@@ -19,6 +19,7 @@
 import type { Env, TokenEnvelope, UserRow, XClientCredentials } from '../types.ts';
 import { decryptForUser, encryptForUser, randomBytes, b64uEncode } from './crypto.ts';
 import { audit, now } from './db.ts';
+import { notify } from './notify.ts';
 import { RefreshError, refreshTokens, toEnvelope } from './xclient.ts';
 import { RelayError } from './errors.ts';
 
@@ -310,19 +311,6 @@ async function handleRefreshFailure(env: Env, user: UserRow, err: unknown): Prom
     xStatus: err.status,
     detail: err.message,
   });
-}
-
-async function notify(env: Env, message: string): Promise<void> {
-  if (!env.ALERT_WEBHOOK_URL) return;
-  try {
-    await fetch(env.ALERT_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: message }),
-    });
-  } catch (err) {
-    console.error('[notify] failed', err);
-  }
 }
 
 /**

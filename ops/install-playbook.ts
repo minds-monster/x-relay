@@ -12,25 +12,65 @@
  * rotate it once a durable secret store is available:
  *     curl -XPOST $BASE/admin/users/<id>/rotate-key -H "X-Admin-Key: ..."
  *
+ * Two contracts exist and they are not interchangeable:
+ *
+ *   x-relay-v1   the full posting contract. For a Mind that should post directly, on
+ *                demand. Knows /x/post, approval pages, retraction.
+ *   x-queue-v1   the content contract. For a Mind whose only job is to write. Knows
+ *                /x/queue and nothing else — it cannot post, cannot pick a time, and
+ *                cannot retract. This is what dedicated content Minds get.
+ *
+ * Giving a content Mind the full contract would hand it a posting primitive it has no
+ * reason to hold, so the playbook is an explicit argument rather than a default.
+ *
  * Usage:
- *   npm run ops -- ops/install-playbook.ts <baseUrl> <relayKey>
- *   npm run ops -- ops/install-playbook.ts <baseUrl> <relayKey> --dry-run
+ *   npm run ops -- ops/install-playbook.ts <baseUrl> <relayKey> [options]
+ *
+ *     --playbook <name|path>   x-relay-v1 (default) | x-queue-v1 | ./path/to.md
+ *     --alias <alias>          conversation to install into
+ *     --dry-run                print what would be sent, key redacted
  */
 import { readFile } from 'node:fs/promises';
 import { ask, resolveOpsAlias, errText } from './minds.ts';
 
-const [, , baseArg, keyArg, ...rest] = process.argv;
-const dryRun = rest.includes('--dry-run');
+const argv = process.argv.slice(2);
+const dryRun = argv.includes('--dry-run');
 
-const base = (baseArg ?? '').replace(/\/$/, '');
-const relayKey = keyArg ?? '';
+function opt(name: string): string | undefined {
+  const i = argv.indexOf(`--${name}`);
+  return i >= 0 ? argv[i + 1] : undefined;
+}
+
+const positional = argv.filter((a, i) => {
+  if (a.startsWith('--')) return false;
+  const prev = argv[i - 1];
+  return !(prev === '--playbook' || prev === '--alias');
+});
+
+const base = (positional[0] ?? '').replace(/\/$/, '');
+const relayKey = positional[1] ?? '';
 
 if (!base || !relayKey) {
-  console.error('Usage: npm run ops -- ops/install-playbook.ts <baseUrl> <relayKey> [--dry-run]');
+  console.error(
+    'Usage: npm run ops -- ops/install-playbook.ts <baseUrl> <relayKey> ' +
+      '[--playbook x-relay-v1|x-queue-v1|<path>] [--alias <alias>] [--dry-run]',
+  );
   process.exit(2);
 }
 
-const template = await readFile(new URL('../playbooks/x-relay-v1.md', import.meta.url), 'utf8');
+const playbookArg = opt('playbook') ?? 'x-relay-v1';
+const playbookUrl = playbookArg.includes('/')
+  ? new URL(playbookArg, `file://${process.cwd()}/`)
+  : new URL(`../playbooks/${playbookArg}.md`, import.meta.url);
+
+let template: string;
+try {
+  template = await readFile(playbookUrl, 'utf8');
+} catch {
+  console.error(`No such playbook: ${playbookUrl.pathname}`);
+  console.error('Known playbooks: x-relay-v1 (full posting), x-queue-v1 (content only)');
+  process.exit(2);
+}
 
 // The playbook refers to the key symbolically. Until tenets are writable we must also
 // supply the literal value, kept in a clearly-delimited block so it is obvious what
@@ -48,7 +88,7 @@ KEY MATERIAL (v1 delivery — no tenet write API exists yet)
 
 console.log(`Base URL : ${base}`);
 console.log(`Relay key: ${relayKey.slice(0, 12)}... (${relayKey.length} chars)`);
-console.log(`Playbook : ${playbook.length} chars\n`);
+console.log(`Playbook : ${playbookArg} (${playbook.length} chars)\n`);
 
 if (dryRun) {
   console.log('--- playbook that WOULD be sent (key redacted) ---\n');
@@ -62,7 +102,7 @@ console.warn(
     '         Rotate it before this setup handles anything you care about.\n',
 );
 
-const alias = await resolveOpsAlias();
+const alias = await resolveOpsAlias(opt('alias'));
 console.log(`Sending playbook to ${alias} ...`);
 
 try {

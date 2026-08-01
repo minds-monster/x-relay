@@ -1,9 +1,9 @@
 # X Relay — status & handover
 
-Single entry point for anyone (human or agent) picking this up. Written 2026-08-01.
+Single entry point for anyone (human or agent) picking this up. Updated 2026-08-01.
 
 [README.md](README.md) has architecture detail and the API table.
-[TESTING.md](TESTING.md) has the 28-step test walkthrough.
+[TESTING.md](TESTING.md) has the test walkthrough.
 
 ---
 
@@ -13,11 +13,23 @@ A **ToS-compliant X (Twitter) posting connector for the Animoca Hello Minds ecos
 Animoca's own `x-api` app cannot post — it is `approved: false` with no OAuth client bound,
 returns `401 No OAuth client bound to this app`, is broken for all ~109 Minds equipped to
 it, and there is no builder-side fix. So we built a replacement: a Cloudflare Worker
-("the relay") that holds X OAuth tokens and posts on the account owner's behalf. The Mind
-calls it over HTTP using its `HTTP_Execute` primitive.
+("the relay") that holds X OAuth tokens and posts on the account owner's behalf.
 
-**It works end to end today.** A real tweet has been posted, both by direct call and via
-the Mind. It is not deployed — it runs locally behind an ngrok tunnel.
+**Its only job is to post well.** Content comes from elsewhere: dedicated Minds (news
+retrieval, composition) submit drafts to a queue over HTTP, and the relay decides when
+each one goes out. A content Mind cannot choose a moment, cannot post twice, and cannot
+post at all — it hands over text and stops. Cadence, spacing, duplicate detection, cost
+control and the human veto all live in one place.
+
+```
+news-mind ─┐
+compose-mind ─┼─ POST /x/queue ──> [queue table]
+other-mind ─┘                           │
+                        Worker cron */5 (Cloudflare, unattended)
+                             │                        │
+                    bind slot + hold            dispatch at slot
+                    notify with veto link       one posting path -> X
+```
 
 ---
 
@@ -25,31 +37,64 @@ the Mind. It is not deployed — it runs locally behind an ngrok tunnel.
 
 | Thing | State |
 |---|---|
-| Relay code | Complete, 28 unit tests passing, typechecks clean |
-| Real tweet posted | **Yes** — via curl, via approval page, and via the Mind |
+| Relay code | Complete, **77 unit tests passing**, both tsconfigs clean |
+| Deployed | **Yes** — https://relay.minds.monster (custom domain, v0.2.0) |
 | X account connected | **Yes** — `@adamunerate` (`1517949596118487043`), status `active` |
-| Deployed to Cloudflare | **No** — blocked on interactive `wrangler login` |
-| Runs unattended | **No** — dies when the laptop sleeps or a terminal closes |
-| Multiple posts/day | **No** — blocked by a one-post-per-day idempotency key (§7.2) |
+| Real tweet posted | **Yes** — via curl, via approval page, and via the Mind |
+| Queue ingest | **Yes** — submit / list / withdraw / idempotent replay all verified live |
+| Multiple posts/day | **Yes** — slot-based idempotency keys (§7.2 closed) |
+| One definition of "day" | **Yes** — UTC slots throughout (§7.3 closed) |
+| Runs unattended | **Not yet** — cron trigger unregistered, see §2.1. This is the one gap. |
 | Crypto (x402) metering | Seam built, deliberately inert |
-| Git | 5 commits on `main`, all work committed, nothing pushed to a remote |
+| Git | Work committed on `main`, nothing pushed to a remote |
 
-**Money spent so far: $0.06** (4 posts at $0.015). Cognition balance ~590.
+**Money spent: $0.075.** Cognition balance ~590.
+
+### 2.1 The one thing that is not working
+
+`wrangler deploy` uploads the code fine but **fails to register the cron trigger**:
+
+```
+PUT /accounts/<id>/workers/scripts/x-relay/schedules
+  10063: You need a workers.dev subdomain in order to proceed.
+```
+
+Cloudflare requires the account to have a workers.dev subdomain before it will accept a
+cron schedule — **even though this Worker is served from a custom domain and does not use
+workers.dev at all.** The account has never had one.
+
+Fix, once: open
+<https://dash.cloudflare.com/?to=/:account/workers/workers-and-pages>. Loading that page
+creates the subdomain automatically. Then `npx wrangler deploy` and confirm:
+
+```bash
+npx wrangler tail    # expect [sweep] ... and [scheduler] ... within 5 minutes
+```
+
+Until that is done the relay accepts drafts and holds them, but nothing is dispatched —
+the queue fills and never drains. Everything else is live.
 
 ---
 
 ## 3. Identifiers and constants
 
 ```
+Relay URL        https://relay.minds.monster            (custom domain on Cloudflare)
+Cloudflare acct  5b55102b4efe93e9e591db8473aa25da
+D1 database      x-relay  12cff7ee-2740-4159-b624-f8ce3c3e835f
+KV namespace     PKCE     a038d3753db141ffb232f5bc444eaafd
 Mind ID          240b453e-f36b-1410-8466-00039ce7df11   ("Adam", adam@hellominds.ai)
 Second Mind      fb12453e-f36b-1410-8466-00039ce7df11   ("Beta", unused)
 Minds API base   https://api.build.hellominds.ai        (auth header: X-Api-Key)
 SDK              @animocabrands/minds-cli@0.1.3 · @animocabrands/minds-client-lib@0.1.3
 X handle         @adamunerate  (X user id 1517949596118487043)
 Relay user id    adam          (single-tenant today)
-Tunnel           https://unsurmised-duke-homy.ngrok-free.dev  (stable per ngrok account)
-Operator TZ      UTC+8 — matters, see §7.3
 ```
+
+**Scheduling is UTC everywhere**, regardless of where the operator is. That is the fix for
+what used to be §7.3: a slot id is derived from UTC alone, so there is no calendar
+ambiguity and no DST arithmetic. Convert to local when you read the schedule, not when the
+code stores it.
 
 **Conversation aliases** (arbitrary aliases work; no `webapp:` prefix needed):
 
@@ -64,24 +109,37 @@ Operator TZ      UTC+8 — matters, see §7.3
 
 ## 4. Current live parameters
 
-From `sh ops/relay.sh user`:
+From `RELAY_ENV=prod sh ops/relay.sh slots`:
 
 ```
-status              active
-requireApproval     true          <- nothing publishes without a human click
-dailyCap            10            <- ROLLING 24h window, not a calendar day
-minIntervalSec      600           <- 10 minutes between posts
-budgetUsdMonth      5.00          <- hard stop; raise before scaling spend
-spendUsdMonth       0.06
-clientType          confidential
-redirectUri         http://127.0.0.1:8787/x/oauth/callback
+slots (UTC)     : 13:00 17:00 21:00     <- THE SCHEDULE. Finite list; bounds posts/day.
+hold window     : 1800s before each slot <- veto window; silence means it publishes
+queue ttl       : 172800s (48h)          <- a draft older than this is dropped, not posted
+min interval    : 3600s                  <- floor on slot spacing; validated on write
+rolling 24h cap : 6                      <- a SAFETY CEILING, not the schedule
+requireApproval : false                  <- the hold window replaces the click
+budgetUsdMonth  : 5.00                   <- hard stop; raise before scaling spend
 ```
 
-Change any of these with `sh ops/relay.sh set '{"dailyCap":20}'`.
+**Two counters, two jobs — do not conflate them.** This distinction is the §7.3 fix and is
+load-bearing:
 
-**Worker vars** (`wrangler.jsonc`): `PAYMENTS_ENABLED=false`, `RELAY_VERSION=0.1.0`,
-`RELAY_BASE_URL` (currently the ngrok URL — this is the **public** URL used to build OAuth
-and approval links).
+- **`slotsUtc`** is *when* posts go out. A finite list, so it also bounds how many.
+- **`rate24hCap`** (stored as `daily_cap`) is a rolling-24-hour ceiling that catches a
+  runaway regardless of the schedule. It is not a calendar-day count and never was; the
+  function behind it is now called `countPostsRolling24h` for that reason.
+
+Change them with:
+
+```bash
+RELAY_ENV=prod sh ops/relay.sh slots 13:00 17:00 21:00   # rejects gaps < minInterval
+RELAY_ENV=prod sh ops/relay.sh hold 1800
+RELAY_ENV=prod sh ops/relay.sh set '{"dailyCap":8}'
+```
+
+**Worker vars** (`wrangler.jsonc`): `PAYMENTS_ENABLED=false`, `RELAY_VERSION=0.2.0`,
+`DEBUG_ECHO_ENABLED=false`, `RELAY_BASE_URL=https://relay.minds.monster` — the **public**
+URL used to build OAuth, approval and veto links.
 
 **Secrets** live in `.dev.vars` (gitignored): `MASTER_KEY_B64`, `ADMIN_KEY`,
 `APPROVAL_HMAC_KEY`. Optional `MASTER_KEY_B64_PREV` for rotation.
@@ -162,14 +220,34 @@ author a skill, or write a tenet. Consequences:
   `duplicate_recent_text`, `min_interval_not_elapsed`.
 - **Approval links are HMAC-signed** — tampering yields 403.
 
+Verified on the deployed relay (2026-08-01, `relay.minds.monster`):
+
+- **Deploy is real.** `/health` returns `version 0.2.0` with `db`, `kv` and all three keys
+  `ok`. `/debug/echo` returns 404 — the diagnostic route is closed in production.
+- **Queue ingest works end to end**: submit returns a `queueId` and a concrete
+  `estimatedSlotUtc`; three drafts landed in three different slots.
+- **Submission idempotency**: resubmitting the same `submissionId` returns
+  `idempotent:true` with the same `queueId` and enqueues nothing.
+- **Submit-time guardrails**: `duplicate_recent_text` (against both posted history and
+  what is already queued), `url_not_allowed`, `text_too_long`.
+- **Schedule validation rejects atomically** — `13:00 13:30` against a 3600s interval is
+  refused with the arithmetic spelled out, and the stored schedule is left untouched.
+- **Veto links are HMAC-signed** — unsigned and tampered tokens both yield 403.
+- **Withdrawal** is a one-way door: a second attempt reports the current status instead of
+  silently succeeding.
+- **`relay.sh` follows `RELAY_ENV`** — direct-SQL commands print their target, so reading
+  the local database while posting to production is no longer possible by accident.
+
 ### Not verified
 
-- **Remote deploy.** Needs interactive `wrangler login`. `wrangler.jsonc` has placeholder
-  binding IDs (`local-placeholder-d1` / `local-placeholder-pkce`) that work for local dev
-  only.
-- **The 15-minute cron sweep.** Local `wrangler dev` does not fire cron triggers. Token
-  refresh currently happens lazily at post time (which works). The proactive sweep is
-  untested in practice.
+- **The cron itself has never fired.** See §2.1 — the trigger is unregistered because the
+  account lacks a workers.dev subdomain. So the token sweep, slot binding, hold
+  notification and dispatch are all covered by unit tests and by their HTTP surface, but
+  none has run on a real timer. **This is the last thing standing between the current
+  state and an unattended relay**, and it should be the first thing checked after the
+  dashboard fix.
+- **A queued draft has never actually reached X.** Same cause.
+- **The Slack alert** (`ALERT_WEBHOOK_URL`) has never fired in production.
 - **Tenet writes / Mind-authored skills.** No API exists; both remain experiments. Note
   Mind-authored skills appear to publish to the public Bazaar — so a key must **never** go
   in a skill body.
@@ -180,45 +258,36 @@ author a skill, or write a tenet. Consequences:
 
 ## 7. Outstanding threads
 
-Roughly in the order they should be tackled.
+### 7.1 Deploy to Cloudflare — **DONE**
 
-### 7.1 Deploy to Cloudflare (highest value)
+Live at https://relay.minds.monster on a custom domain. D1, KV, all four secrets, OAuth
+re-run against the new callback. One residual: the cron trigger, §2.1 — do that next.
 
-Everything else is fragile until this is done. Currently the relay lives on a laptop behind
-a tunnel: sleep the Mac or close a terminal and the Mind gets a dead URL.
+### 7.2 Multiple posts per day — **DONE**
 
-```bash
-npx wrangler login                       # interactive — a human must do this
-npx wrangler d1 create x-relay           # paste database_id into wrangler.jsonc
-npx wrangler kv namespace create PKCE    # paste id into wrangler.jsonc
-npx wrangler d1 execute x-relay --remote --file=schema.sql
-npx wrangler secret put MASTER_KEY_B64   # and ADMIN_KEY, APPROVAL_HMAC_KEY
-npx wrangler deploy
-```
+The idempotency key is now the **slot**: `slot:adam:2026-08-01T13:00Z`. Minute-precise
+UTC, unique per slot per day, so several posts a day are the normal case rather than a
+special one, while two cron ticks landing in the same slot still collapse to a single
+tweet. `worker/lib/schedule.ts` owns the arithmetic and is pure, so it is unit-tested
+without a database.
 
-Then: set `RELAY_BASE_URL` to the workers.dev origin, add
-`https://<origin>/x/oauth/callback` to the X app's callback list, re-run OAuth, re-provision
-the user (remote D1 starts empty), and re-install the playbook. The cron sweep starts
-working automatically once deployed.
+Nothing on the operator's laptop schedules anything any more. The Worker's cron does it,
+which is what makes the relay survive a closed lid.
 
-### 7.2 Multiple posts per day — blocked by design, needs a change
+### 7.3 Two conflicting definitions of "day" — **DONE**
 
-`ops/daily-loop.ts` uses `idempotencyKey: daily-<UTC date>`. A second run the same day
-returns "already posted today" instead of posting. To support N posts/day:
-
-- Per-slot idempotency keys (`daily-2026-08-01-slot2`, or a time bucket).
-- Per-slot conversation aliases, or replay will recur on runs 2+ (§8.5).
-- Raise `dailyCap` / lower `minIntervalSec` to match.
-- Scheduling: nothing schedules anything today. Needs launchd/cron entries per slot.
-
-### 7.3 Two conflicting definitions of "day"
-
-The daily cap is a **rolling 24h window**; the idempotency key is the **UTC calendar date**.
-The operator is UTC+8, so the key rolls at 08:00 local — not local midnight, and not aligned
-with the cap. Invisible at one post/day; confusing the moment slots exist. Make it
-timezone-aware or slot-based when doing §7.2.
+Resolved by giving the two counters different names and different jobs rather than trying
+to reconcile them (see §4). Slots are UTC everywhere: no calendar-vs-rolling ambiguity, no
+DST arithmetic, and `countPostsToday` — the name that caused the confusion — is now
+`countPostsRolling24h`.
 
 ### 7.4 Content quality — the real lever is input, not prompting
+
+**This is now the main open thread, and the architecture is ready for it.** The queue
+accepts drafts from any number of Minds, each with its own relay key
+(`relay.sh key-add <label>`) and its own copy of the smaller
+[x-queue-v1](playbooks/x-queue-v1.md) contract. A news-retrieval Mind and a composition
+Mind can be stood up independently of the relay and swapped without touching it.
 
 Current drafts are competent but samey (every one was "here's an agent signal nobody
 tracks"), because the Mind is handed a topic string and free-associates. Options, in rough
@@ -248,15 +317,24 @@ Two distinct meanings of HTTP 402 in this codebase, deliberately kept apart:
 
 ### 7.6 Housekeeping
 
-- **Rotate the relay key** — it is in the `relay:x-ops` transcript and in LTM.
-  `sh ops/relay.sh rotate`, then re-run `install-playbook.ts` within the 24h grace window.
-- **Disable the diagnostic echo route** once `HTTP_Execute` behaviour is settled:
-  `DEBUG_ECHO_ENABLED=false`. It is unauthenticated by necessity (it measures auth
-  handling) and redacts credentials, but it should not stay open in production.
-- **No git remote.** Nothing is pushed anywhere. `.env`, `.dev.vars` and `.relay-key` are
-  gitignored; verified `.env` was never committed.
+Done:
+
+- **Diagnostic echo route closed** — `DEBUG_ECHO_ENABLED=false` in `wrangler.jsonc`;
+  `/debug/echo` returns 404 in production.
+- **`redirectUri`** now points at the deployed callback (fixed by the Phase 1 re-OAuth).
+- **`.gitignore`** covers `.env.prod` and `.relay-key.*`, which the new prod workflow
+  creates. Without that a `git add -A` would have committed the production admin key.
+
+Still open:
+
+- **Rotate the relay key.** It is in the `relay:x-ops` transcript and in LTM. Do this
+  *after* the cron works and the content Minds are set up, so the new key is distributed
+  once: `RELAY_ENV=prod sh ops/relay.sh rotate`, then re-run `install-playbook.ts` for each
+  Mind within the 24h grace window.
+- **No git remote.** Nothing is pushed anywhere. Pre-flight before creating one:
+  `git log --all --full-history -- .env .dev.vars .relay-key .env.prod` must be empty.
+  Make the repo **private** — the playbooks describe the auth model in detail.
 - Delete the stale `relay:x-daily-20260731` conversation.
-- `redirectUri` on the user record is still the localhost callback; update on deploy.
 
 ---
 
@@ -277,7 +355,7 @@ does. Clearing on a transient error turns a 30-second X outage into permanent
 disconnection. The two-consecutive-refreshes test is the canary; run it after any change
 here.
 
-### 8.2 Idempotency ordering (`worker/routes/post.ts`)
+### 8.2 Idempotency ordering (`worker/lib/dispatch.ts`)
 
 The idempotency claim happens **before** the dedupe and quota checks. Reversed — as it was
 originally — a legitimate retry carrying the same key trips `duplicate_recent_text` against
@@ -286,6 +364,30 @@ the double-post the layer exists to prevent. Do not reorder.
 
 Callers omitting a key get one synthesised from `sha256(userId|normalizedText|5-min bucket)`,
 so even a naive retry cannot double-post within five minutes.
+
+**There is exactly one posting path**, `dispatchPost()`, used by both the `/x/post` route
+and the cron dispatcher. A scheduler with its own copy of this ordering would drift from
+it, and the guardrails are most of what this service is worth. `routes/post.ts` is now
+only request parsing and JSON shaping.
+
+### 8.2b Cron phase order (`worker/lib/scheduler.ts`)
+
+Bind-and-hold runs **before** dispatch, every tick. Swapped, a draft submitted shortly
+before its slot could be bound and sent within the same tick — reaching X before the alert
+reached a phone, silently removing the only human check in an otherwise unattended system.
+Binding first guarantees at least one tick of hold.
+
+Ticks are assumed unreliable — Cloudflare may skip, delay or overlap one — so every step is
+idempotent: binding is guarded by a unique index on `(user_id, slot_id)`, and dispatch is
+guarded by the slot idempotency key. A slot missed by more than 30 minutes is **dropped and
+reported**, not posted late; a 09:00 post arriving at 14:00 is usually worse than silence.
+
+### 8.2c A failed or vetoed slot stays empty
+
+The dispatcher never promotes the next queued draft into a slot that just failed or was
+vetoed. Substituting different content into a slot a human just rejected would defeat the
+veto window, and an account in a failing state would burn the entire queue one draft per
+tick. The slot goes empty and you get told why.
 
 ### 8.3 Encryption AAD (`worker/lib/crypto.ts`)
 
@@ -304,10 +406,12 @@ Two mechanisms exist because of this:
 - **`clientNonce`** — callers mint a random value per run, send it, then look for it in
   `audit.detail`. A *missing* audit row is ambiguous (the request may have failed); a
   *matching nonce* is proof, because the value did not exist before the run began.
-- **Generation/execution split** — `ops/daily-loop.ts` asks the Mind only for text and
-  performs the POST itself, so the side effect lives in code that cannot skip it.
-  `ops/ask-mind-to-post.ts` keeps the Mind in charge on purpose, because testing that path
-  is its job.
+- **Generation is structurally separated from publishing.** A content Mind cannot post at
+  all — its contract only reaches `/x/queue`, and the side effect lives in the Worker's
+  cron, which has no capacity to decide to skip it. This is stronger than the old
+  arrangement (a local script that did the POST), because it no longer depends on which
+  script the operator happens to run. `ops/ask-mind-to-post.ts` keeps a Mind in charge of
+  `/x/post` on purpose, because testing that path is its job.
 
 `via` in the audit table is **best-effort** (the Mind sends `X-Relay-Via` inconsistently).
 The nonce is authoritative.
@@ -318,13 +422,25 @@ A conversation that already contains a similar request will return the earlier a
 fresh conversation produces fresh text every time. Hence per-day aliases plus an automatic
 retry in a throwaway conversation. Overridable with `RELAY_OPS_ALIAS`.
 
-### 8.6 Ops scripts must not call through the tunnel
+Now that several drafts a day are normal, the per-run **request id** — not the per-day
+alias — is what keeps each draft honest inside a shared conversation.
 
-They run on the same machine as the relay. Routing their own HTTP through ngrok measured
-~1.3s versus ~0.01s direct, with intermittent hard failures — one of which destroyed an
-already-generated draft. `ops/relay-client.ts` prefers `127.0.0.1`, falls back to the public
-URL, and retries 3× with a 20s timeout. `RELAY_BASE_URL` stays the **public** URL because
-the Worker builds browser-facing links from it.
+### 8.6 Ops scripts prefer localhost
+
+`ops/relay-client.ts` tries `127.0.0.1` first and falls back to the public URL, retrying 3×
+with a 20s timeout. That mattered acutely in the tunnel era (~1.3s via ngrok versus ~0.01s
+direct, with intermittent failures, one of which destroyed an already-generated draft).
+Against the deployed relay the localhost probe just fails fast and the public URL is used.
+`RELAY_BASE_URL` stays the **public** URL because the Worker builds browser-facing OAuth,
+approval and veto links from it.
+
+### 8.6b `relay.sh` reads a different database depending on `RELAY_ENV`
+
+`me`, `post` and `queue` are HTTP and follow `RELAY_BASE_URL`; `audit`, `posts` and
+`tokens` are direct D1 queries. Before, the latter were hardcoded to `--local`, so after
+deploying, `relay.sh audit` showed an empty local database while `relay.sh me` talked to
+production — the most confusing possible failure. Both now follow `RELAY_ENV`, and the
+direct-SQL commands print their target. Keep it that way.
 
 ### 8.7 Dry runs are audited
 
@@ -350,33 +466,45 @@ Keep dry runs audited.
 
 ```
 worker/                     the relay (Cloudflare Worker, Hono)
-  index.ts                  routes + error boundary + scheduled() cron
+  index.ts                  routes + error boundary + scheduled() cron entry point
   types.ts                  Env bindings and row types
   lib/crypto.ts             HKDF + AES-GCM envelope, AAD binding, PKCE, HMAC
   lib/tokens.ts             refresh loop, rotation persistence, CAS lock   <- riskiest
+  lib/dispatch.ts           THE posting path — route and cron both call it   <- read §8.2
+  lib/scheduler.ts          the cron body: bind+hold, then dispatch         <- read §8.2b
+  lib/schedule.ts           slot arithmetic. PURE — no D1, no clock of its own
+  lib/queue.ts              queue table access; slot binding, veto, expiry
   lib/xclient.ts            raw X API calls, cost constants, error classes
   lib/errors.ts             one error envelope; X error -> relay code mapping
   lib/guardrails.ts         URL detection, length, dedupe, caps, budget
   lib/idempotency.ts        insert-first claim, replay, synthesised keys
   lib/auth.ts               relay-key auth (sha256 only), admin auth, via detection
   lib/db.ts                 D1 helpers, audit writer
+  lib/notify.ts             operator alerts via ALERT_WEBHOOK_URL; never throws
+  lib/html.ts               the one page shell: OAuth, approval, veto
   lib/paywall.ts            x402 seam (inert)
-  routes/{health,admin,oauth,post,approve,debug}.ts
+  routes/{health,admin,oauth,post,queue,approve,debug}.ts
 ops/                        local Node CLI — holds the builder JWT, never deployed
-  relay.sh                  thin CLI: health/provision/connect/me/post/audit/rotate/...
+  relay.sh                  CLI: health/me/slots/hold/queue/submit/keys/audit/rotate/...
+                            RELAY_ENV=prod targets the deployed relay        <- read §8.6b
   relay-client.ts           localhost-preferring HTTP client with retries + nonce lookup
   minds.ts                  Minds client, alias resolution, HTML strip, JSON extraction
-  install-playbook.ts       sends the contract, asks for LTM_Push, verifies
-  ask-mind-to-post.ts       Mind-driven post, nonce-proven
-  daily-loop.ts             Mind drafts -> this script posts -> nonce verified
+  install-playbook.ts       installs a contract; --playbook picks which
+  ask-mind-to-post.ts       Mind-driven direct post, nonce-proven
+  submit-draft.ts           Mind drafts -> submitted to the queue -> nonce verified
+                            (was daily-loop.ts, which also posted; the cron does that now)
   probe-relay-echo.ts       proves HTTP_Execute forwards auth headers
   probe-http-execute.ts     earlier third-party-echo variant (kept for reference)
   unequip-x-apps.ts         removes x-api / Clawk / Twitter CLI
   setup-local.sh            idempotent local bring-up (--reset wipes data)
   set-base-url.sh           updates RELAY_BASE_URL in .dev.vars and .env
-playbooks/x-relay-v1.md     the Mind-facing contract — source of truth
-schema.sql                  D1 schema: users, relay_keys, posts, audit
-test/                       28 unit tests
+playbooks/
+  x-relay-v1.md             full posting contract — for a Mind that posts directly
+  x-queue-v1.md             content contract — submit only; cannot post, cannot pick a time
+schema.sql                  D1 schema: users, relay_keys, posts, queue, audit
+migrations/001-queue.sql    additive ALTERs for databases that predate the queue
+test/                       77 unit tests
+  helpers/d1.ts             D1 adapter over node:sqlite, so queue tests run the real DDL
 ```
 
 **Apps unequipped from the Mind** (reversible via `client.equipApps`):
@@ -393,29 +521,61 @@ Still equipped: `Animoca Composio`, `Animoca Minds Auth`.
 
 ## 10. Running it
 
+### Against production (the normal case)
+
+`RELAY_ENV=prod` switches config to `.env.prod` **and** D1 queries to `--remote`. Export it
+once per shell; forgetting it is how you end up reading an empty local database.
+
 ```bash
-# terminal 1 — the relay
-sh ops/setup-local.sh && npx wrangler dev
+export RELAY_ENV=prod
 
-# terminal 2 — commands
-sh ops/relay.sh health
-sh ops/relay.sh me
-sh ops/relay.sh dry "some text"
-sh ops/relay.sh post "some text" my-idem-key
-sh ops/relay.sh audit          # ground truth for what actually happened
-sh ops/relay.sh user           # full state + guardrails
+sh ops/relay.sh me              # account state, schedule, spend
+sh ops/relay.sh slots           # the schedule
+sh ops/relay.sh queue           # what is waiting, and which slot each lands in
+sh ops/relay.sh audit           # ground truth. A Mind's self-report is not evidence.
 
-# terminal 3 — only needed for the Mind to reach the relay
-ngrok http 8787
-sh ops/set-base-url.sh https://<tunnel>   # then restart terminal 1
+sh ops/relay.sh submit "text"   # enqueue by hand
+sh ops/relay.sh unqueue 7       # pull one back
 
-# Mind-driven
-npm run ops -- ops/probe-relay-echo.ts https://<tunnel>
-npm run ops -- ops/install-playbook.ts https://<tunnel> "$(cat .relay-key)"
-npm run ops -- ops/ask-mind-to-post.ts "text"
-npm run ops -- ops/daily-loop.ts --dry-run
+sh ops/relay.sh slots 13:00 17:00 21:00   # change the schedule (UTC)
+sh ops/relay.sh hold 1800                 # change the veto window
+
+npx wrangler tail               # watch [sweep] and [scheduler] each tick
+```
+
+### Adding a content Mind
+
+```bash
+sh ops/relay.sh key-add news-mind         # its own key; revoking it spares the others
+npm run ops -- ops/install-playbook.ts https://relay.minds.monster '<key>' \
+    --playbook x-queue-v1 --alias relay:news-mind
+```
+
+The Mind then submits with `POST /x/queue` and never sees `/x/post`.
+
+### Local development
+
+```bash
+sh ops/setup-local.sh && npx wrangler dev          # terminal 1
+npx wrangler d1 execute x-relay --local --file=migrations/001-queue.sql   # first time only
+sh ops/relay.sh health                             # terminal 2, no RELAY_ENV
+npm run ops -- ops/submit-draft.ts --dry-run
 
 npm run typecheck && npx vitest run
+```
+
+`wrangler dev` does **not** fire cron triggers, so the scheduler never runs locally. Test
+slot logic through `test/schedule.test.ts` and `test/queue.test.ts`, which run the real
+schema against an in-memory SQLite; verify the timer itself with `wrangler tail` in
+production.
+
+### Deploying
+
+```bash
+npm run typecheck && npx vitest run
+npx wrangler deploy --dry-run
+npx wrangler d1 execute x-relay --remote --file=migrations/00N-*.sql   # if schema changed
+npx wrangler deploy
 ```
 
 ---

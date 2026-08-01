@@ -81,7 +81,15 @@ export async function getPostById(env: Env, id: number): Promise<PostRow | null>
   return env.DB.prepare('SELECT * FROM posts WHERE id = ?1').bind(id).first<PostRow>();
 }
 
-export async function countPostsToday(
+/**
+ * Posts in the ROLLING last 24 hours. Named for what it measures.
+ *
+ * It was `countPostsToday`, which invited the reading "posts so far on the current
+ * calendar day" — a different number, and the source of the two-definitions-of-day
+ * confusion this scheduler exists to remove. The calendar-day question is now answered by
+ * the slot schedule (lib/schedule.ts); this function only backs the safety ceiling.
+ */
+export async function countPostsRolling24h(
   env: Env,
   userId: string,
   excludePostId = 0,

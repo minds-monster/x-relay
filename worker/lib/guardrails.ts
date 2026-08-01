@@ -9,7 +9,7 @@
 import type { Env, UserRow } from '../types.ts';
 import { RelayError } from './errors.ts';
 import {
-  countPostsToday,
+  countPostsRolling24h,
   findRecentDuplicate,
   lastPostAt,
   rollSpendMonth,
@@ -103,12 +103,14 @@ export async function checkQuotas(
     );
   }
 
-  const todayCount = await countPostsToday(env, user.user_id, excludePostId);
-  if (todayCount >= user.daily_cap) {
+  // A ROLLING-24h ceiling, not a calendar-day count and not the schedule. The schedule is
+  // the user's slot list; this is the backstop that catches a runaway regardless of it.
+  const recentCount = await countPostsRolling24h(env, user.user_id, excludePostId);
+  if (recentCount >= user.daily_cap) {
     throw new RelayError(
       'daily_cap_reached',
       429,
-      `Daily cap of ${user.daily_cap} posts reached (${todayCount} in the last 24h).`,
+      `Rolling 24h cap of ${user.daily_cap} posts reached (${recentCount} in the last 24h).`,
     );
   }
 
