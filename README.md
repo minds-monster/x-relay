@@ -1,5 +1,10 @@
 # X Relay
 
+> **New here? Read [STATUS.md](STATUS.md) first.** It covers current state, live
+> parameters, what is and isn't verified, outstanding work, and the non-obvious landmines.
+> This file covers architecture and the API surface; [TESTING.md](TESTING.md) is the
+> step-by-step test walkthrough.
+
 A ToS-compliant X (Twitter) posting connector for the Animoca **Hello Minds** ecosystem.
 
 It replaces the platform's `x-api` app, which is `approved: false` with no OAuth client
