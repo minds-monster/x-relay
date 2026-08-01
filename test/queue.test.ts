@@ -167,6 +167,26 @@ describe('dispatch selection', () => {
     expect(await dueForDispatch(db.env, NOW() + 86_400)).toEqual([]);
   });
 
+  // Without the notice floor, a slot falling exactly on a cron tick would be bound and
+  // published in the same tick: the Slack alert and the tweet leave together and the veto
+  // window is zero, which is the one thing the hold design exists to prevent.
+  it('will not dispatch a draft bound during this same tick', async () => {
+    const tick = NOW();
+    await enqueue();
+    await bindToSlot(db.env, 'adam', 'adam:2026-08-01T09:00Z', tick);
+
+    expect(await dueForDispatch(db.env, tick, 60)).toEqual([]);
+    // One tick later it is fair game.
+    expect((await dueForDispatch(db.env, tick + 300, 60)).length).toBe(1);
+  });
+
+  it('dispatches immediately when no notice floor is asked for', async () => {
+    const tick = NOW();
+    await enqueue();
+    await bindToSlot(db.env, 'adam', 'adam:2026-08-01T09:00Z', tick);
+    expect((await dueForDispatch(db.env, tick)).length).toBe(1);
+  });
+
   it('stops returning a draft once it is marked posted', async () => {
     await enqueue();
     const bound = await bindToSlot(db.env, 'adam', 'adam:2026-08-01T09:00Z', NOW() - 10);

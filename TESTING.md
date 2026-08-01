@@ -647,14 +647,21 @@ real, to a real audience.
 
 ## Step 31 — a slot firing, end to end
 
-Set a slot a few minutes out with a short hold window, so you do not wait an hour:
+Set a slot a few minutes out. Pick a time **at least two ticks away** — 10 minutes or more
+— so one tick binds it and a later tick dispatches it:
 
 ```bash
-sh ops/relay.sh hold 60
-sh ops/relay.sh slots <the next 5-minute boundary, UTC>
+sh ops/relay.sh slots <a UTC time 10+ minutes out>
 sh ops/relay.sh submit "something you are content to publish"
 npx wrangler tail
 ```
+
+**Do not shorten `hold_sec` to speed this up.** It is tempting and it used to break the
+test in a confusing way: binding only happens on a cron tick, so a hold window shorter
+than the tick gap leaves slots that no tick observes, and the post silently never happens.
+The scheduler now floors its lookahead at one tick regardless of `hold_sec`, so a short
+hold is merely ignored rather than harmful — but leave it at its real value so you are
+testing the real behaviour.
 
 Watch for, in this order:
 
@@ -697,6 +704,11 @@ sh ops/relay.sh hold 1800
 sh ops/relay.sh slots 13:00 17:00 21:00
 sh ops/relay.sh queue     # confirm empty before you walk away
 ```
+
+**Restoring the schedule does not disarm a draft that is already `held`.** Dispatch is
+driven by the row's `hold_until`, not by the current slot list, so removing the slot it was
+bound to changes nothing. To be sure a test draft cannot publish, resolve the row itself —
+click **Stop it**, or `sh ops/relay.sh unqueue <queueId>` — and confirm `queue` is empty.
 
 ---
 

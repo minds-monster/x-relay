@@ -44,15 +44,16 @@ other-mind ─┘                           │
 | Queue ingest | **Yes** — submit / list / withdraw / idempotent replay all verified live |
 | Multiple posts/day | **Yes** — slot-based idempotency keys (§7.2 closed) |
 | One definition of "day" | **Yes** — UTC slots throughout (§7.3 closed) |
-| Runs unattended | **Not yet** — cron trigger unregistered, see §2.1. This is the one gap. |
+| Runs unattended | **Yes** — cron firing every 5 min; bind, hold, alert and veto all verified live |
 | Crypto (x402) metering | Seam built, deliberately inert |
 | Git | Work committed on `main`, nothing pushed to a remote |
 
 **Money spent: $0.075.** Cognition balance ~590.
 
-### 2.1 The one thing that is not working
+### 2.1 Deploying the cron trigger needs a workers.dev subdomain — resolved, but read this
 
-`wrangler deploy` uploads the code fine but **fails to register the cron trigger**:
+`wrangler deploy` uploaded the code fine while silently **failing to register the cron
+trigger**:
 
 ```
 PUT /accounts/<id>/workers/scripts/x-relay/schedules
@@ -60,19 +61,15 @@ PUT /accounts/<id>/workers/scripts/x-relay/schedules
 ```
 
 Cloudflare requires the account to have a workers.dev subdomain before it will accept a
-cron schedule — **even though this Worker is served from a custom domain and does not use
-workers.dev at all.** The account has never had one.
+cron schedule — **even though this Worker is served from a custom domain and never uses
+workers.dev.** Resolved on 2026-08-01 by opening
+<https://dash.cloudflare.com/?to=/:account/workers/workers-and-pages> once, which creates
+the subdomain automatically.
 
-Fix, once: open
-<https://dash.cloudflare.com/?to=/:account/workers/workers-and-pages>. Loading that page
-creates the subdomain automatically. Then `npx wrangler deploy` and confirm:
-
-```bash
-npx wrangler tail    # expect [sweep] ... and [scheduler] ... within 5 minutes
-```
-
-Until that is done the relay accepts drafts and holds them, but nothing is dispatched —
-the queue fills and never drains. Everything else is live.
+Worth remembering because the failure mode is quiet: the deploy reports success for the
+code and the custom domain, and the cron line is simply absent. A successful deploy now
+prints `schedule: */5 * * * *`. If it does not, nothing is dispatched — drafts queue and
+the queue never drains.
 
 ---
 
@@ -238,16 +235,25 @@ Verified on the deployed relay (2026-08-01, `relay.minds.monster`):
 - **`relay.sh` follows `RELAY_ENV`** — direct-SQL commands print their target, so reading
   the local database while posting to production is no longer possible by accident.
 
+Verified on a real timer (2026-08-01, ~90 minutes of `wrangler tail`):
+
+- **Cron fires every 5 minutes**, no gaps.
+- **The proactive token sweep works** — `[sweep] checked=1 refreshed=1`, a refresh-token
+  rotation performed off the posting path. This was the sweep's entire purpose and had
+  never been observed before.
+- **Slot binding** — a draft went `queued` → `held` at 10:45:54 for an 11:05 slot.
+- **The Slack alert fires**, carrying the draft text and a working veto link.
+- **The veto path, end to end** — clicking the link produced `status='vetoed'` and an
+  audit row `via=approval route=queue/veto code=vetoed`, and **no post row was created**.
+
 ### Not verified
 
-- **The cron itself has never fired.** See §2.1 — the trigger is unregistered because the
-  account lacks a workers.dev subdomain. So the token sweep, slot binding, hold
-  notification and dispatch are all covered by unit tests and by their HTTP surface, but
-  none has run on a real timer. **This is the last thing standing between the current
-  state and an unattended relay**, and it should be the first thing checked after the
-  dashboard fix.
-- **A queued draft has never actually reached X.** Same cause.
-- **The Slack alert** (`ALERT_WEBHOOK_URL`) has never fired in production.
+- **A queued draft has never actually reached X under cron.** Everything up to the final
+  X call is proven; the call itself is proven only through `/x/post` (three real tweets).
+  The first genuine scheduled post will close this. Deliberately not forced with a test
+  post, because that means publishing to a live timeline.
+- **A dispatch failure** (`failed` status, the alert, the empty slot) has never occurred
+  in production, only in tests.
 - **Tenet writes / Mind-authored skills.** No API exists; both remain experiments. Note
   Mind-authored skills appear to publish to the public Bazaar — so a key must **never** go
   in a skill body.
@@ -381,6 +387,22 @@ Ticks are assumed unreliable — Cloudflare may skip, delay or overlap one — s
 idempotent: binding is guarded by a unique index on `(user_id, slot_id)`, and dispatch is
 guarded by the slot idempotency key. A slot missed by more than 30 minutes is **dropped and
 reported**, not posted late; a 09:00 post arriving at 14:00 is usually worse than silence.
+
+Two constants exist because the tick interval leaks into correctness. Both were real bugs,
+found by reading actual tick timestamps against the code rather than by testing:
+
+- **`MIN_BIND_LOOKAHEAD_SEC`** — binding only happens on a tick, so looking ahead exactly
+  `hold_sec` leaves blind spots when `hold_sec` is shorter than the tick gap. At
+  `hold_sec=60` with 5-minute ticks, roughly four slots in five were never bound, never
+  dispatched and never reported: the post simply did not happen, with nothing in the logs.
+  The lookahead is floored at one tick plus a margin. Binding early only ever means more
+  warning, so erring long is the safe direction.
+- **`MIN_NOTICE_SEC`** — a slot landing on a tick boundary was bound and dispatched within
+  that same tick, so the alert and the tweet left together and the veto window was zero.
+  Dispatch now requires the row to have been held since an earlier tick.
+
+**If you change the cron interval, change `CRON_INTERVAL_SEC` in `scheduler.ts` with it.**
+Nothing enforces that they agree.
 
 ### 8.2c A failed or vetoed slot stays empty
 

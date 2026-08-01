@@ -46,6 +46,29 @@ import type { Env, UserRow } from '../types.ts';
  */
 const DISPATCH_GRACE_SEC = 30 * 60;
 
+/** The configured cron interval. Keep in step with `triggers.crons` in wrangler.jsonc. */
+const CRON_INTERVAL_SEC = 5 * 60;
+
+/**
+ * Never look less than this far ahead when binding, whatever `hold_sec` says.
+ *
+ * One cron interval plus a margin. A shorter lookahead than the tick gap means slots that
+ * no tick ever sees, and a slot that is never bound is never dispatched and never
+ * reported — a post that silently does not happen.
+ */
+const MIN_BIND_LOOKAHEAD_SEC = CRON_INTERVAL_SEC + 60;
+
+/**
+ * A draft must have been held for at least this long before it may be dispatched.
+ *
+ * Without it, a slot falling on a tick boundary would be bound and published within the
+ * same tick: the alert and the tweet leave together, and the veto window — the only human
+ * check in an unattended system — is zero. The floor guarantees the announcement lands at
+ * least one tick before the post. A slot caught this way goes out one tick late, well
+ * inside DISPATCH_GRACE_SEC.
+ */
+const MIN_NOTICE_SEC = 60;
+
 export interface SchedulerResult {
   expired: number;
   bound: number;
@@ -100,13 +123,18 @@ async function bindAndHold(
 
   result.expired += await expireStale(env, user.user_id);
 
-  // Slots whose hold window is open right now: they are in the future, but within
-  // hold_sec of firing. Look one tick beyond the window's leading edge so a slot cannot
-  // slip between ticks unbound.
-  const windowStart = atSec;
-  const windowEnd = atSec + user.hold_sec;
+  // Slots to bind on this tick: those firing within the lookahead.
+  //
+  // The lookahead is `hold_sec`, but never less than one cron interval plus a margin.
+  // That floor is not cosmetic. Binding only happens on a tick, so a lookahead shorter
+  // than the gap between ticks leaves gaps no tick ever observes: with hold_sec=60 and
+  // 5-minute ticks, roughly four slots in five would never be bound, never dispatched,
+  // and never reported — the post would simply not happen. Widening the lookahead binds
+  // earlier than requested, which only ever means MORE warning before publication, so
+  // erring long is the safe direction.
+  const lookahead = Math.max(user.hold_sec, MIN_BIND_LOOKAHEAD_SEC);
 
-  for (const slot of slotsInWindow(user.user_id, slots, windowStart, windowEnd)) {
+  for (const slot of slotsInWindow(user.user_id, slots, atSec, atSec + lookahead)) {
     if (await slotIsBound(env, user.user_id, slot.id)) continue;
 
     const bound = await bindToSlot(env, user.user_id, slot.id, slot.atSec);
@@ -132,7 +160,7 @@ async function bindAndHold(
 // ---------------------------------------------------------------------------
 
 async function dispatchDue(env: Env, atSec: number, result: SchedulerResult): Promise<void> {
-  for (const item of await dueForDispatch(env, atSec)) {
+  for (const item of await dueForDispatch(env, atSec, MIN_NOTICE_SEC)) {
     const slotSec = item.hold_until ?? atSec;
 
     // Too late to be worth sending. Report it — a slot that silently does nothing is the

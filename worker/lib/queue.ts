@@ -156,14 +156,27 @@ export async function slotIsBound(env: Env, userId: string, slotId: string): Pro
   return row !== null;
 }
 
-/** Held drafts whose slot time has arrived. */
-export async function dueForDispatch(env: Env, atSec: number, limit = 10): Promise<QueueRow[]> {
+/**
+ * Held drafts whose slot time has arrived AND which have been held long enough.
+ *
+ * `minNoticeSec` is what stops a slot falling on a tick boundary from being bound and
+ * published in the same tick — which would send the alert and the tweet together and make
+ * the veto window zero. `updated_at` is the bind time, so the condition reads "this was
+ * held on an earlier tick".
+ */
+export async function dueForDispatch(
+  env: Env,
+  atSec: number,
+  minNoticeSec = 0,
+  limit = 10,
+): Promise<QueueRow[]> {
   const { results } = await env.DB.prepare(
     `SELECT * FROM queue
       WHERE status = 'held' AND hold_until IS NOT NULL AND hold_until <= ?1
-      ORDER BY hold_until ASC LIMIT ?2`,
+        AND updated_at <= ?2
+      ORDER BY hold_until ASC LIMIT ?3`,
   )
-    .bind(atSec, limit)
+    .bind(atSec, atSec - minNoticeSec, limit)
     .all<QueueRow>();
   return results ?? [];
 }

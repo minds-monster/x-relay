@@ -166,6 +166,41 @@ describe('slotsInWindow', () => {
   });
 });
 
+describe('tick coverage', () => {
+  // Binding only happens on a cron tick, so the lookahead must be at least the tick gap.
+  // With a 60s lookahead and 5-minute ticks, most slots fall in a gap no tick observes:
+  // never bound, never dispatched, never reported — the post just does not happen.
+  // scheduler.ts therefore floors the lookahead at MIN_BIND_LOOKAHEAD_SEC.
+  const CRON = 300;
+  const LOOKAHEAD_FLOOR = 360;
+  const slots = ['13:00', '17:00', '21:00'];
+
+  /** Walk a full day of ticks and collect every slot some tick would bind. */
+  function slotsSeenAcrossADay(lookahead: number): Set<string> {
+    const seen = new Set<string>();
+    const start = at('2026-08-01T00:00:00Z');
+    for (let t = start; t < start + 86_400; t += CRON) {
+      for (const s of slotsInWindow('adam', slots, t, t + lookahead)) seen.add(s.id);
+    }
+    return seen;
+  }
+
+  it('misses slots when the lookahead is shorter than the tick gap', () => {
+    // Ticks at :00 and :05 straddle 13:00 with a 60s window that never contains it.
+    const offGrid = at('2026-08-01T12:57:30Z');
+    expect(slotsInWindow('adam', slots, offGrid, offGrid + 60)).toEqual([]);
+    expect(slotsInWindow('adam', slots, offGrid + CRON, offGrid + CRON + 60)).toEqual([]);
+  });
+
+  it('sees every slot once the lookahead is floored at one tick plus margin', () => {
+    expect(slotsSeenAcrossADay(LOOKAHEAD_FLOOR).size).toBe(slots.length);
+  });
+
+  it('still sees every slot with a long hold window', () => {
+    expect(slotsSeenAcrossADay(1800).size).toBe(slots.length);
+  });
+});
+
 describe('nextSlotAfter', () => {
   const slots = ['09:00', '13:00', '18:00'];
 
