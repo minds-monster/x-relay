@@ -38,7 +38,7 @@ No tunnel, no Mind, no Cloudflare account. Just your machine and X.
 ## Step 1 — Start the relay  (Terminal 1)
 
 ```bash
-cd ~/adam-mind
+cd ~/x-relay
 sh ops/setup-local.sh
 ```
 
@@ -70,7 +70,7 @@ Wait for the last line to read:
 Open a **new** terminal window.
 
 ```bash
-cd ~/adam-mind
+cd ~/x-relay
 sh ops/relay.sh health
 ```
 
