@@ -7,7 +7,41 @@
  */
 import { createMindsClient } from '@animocabrands/minds-client-lib';
 
-export const MIND_ID = '240b453e-f36b-1410-8466-00039ce7df11'; // "Adam"
+/**
+ * Minds on this account. Their ids differ only in the first GUID segment, which makes
+ * them very easy to confuse by eye — always resolve through this map or `--mind <name>`
+ * rather than pasting an id.
+ */
+export const MINDS = {
+  adam: '240b453e-f36b-1410-8466-00039ce7df11',
+  beta: 'fb12453e-f36b-1410-8466-00039ce7df11',
+  trend: '749b453e-f36b-1410-8466-00039ce7df11',
+} as const;
+
+export type MindName = keyof typeof MINDS;
+
+/**
+ * Default target. Overridable with MINDS_MIND_ID (a name or a raw id) because the vault
+ * and the relay are not necessarily installed on the same Mind — installing a contract on
+ * whichever Mind happened to be hardcoded is how a credential ends up in the wrong
+ * transcript.
+ */
+export const MIND_ID = resolveMindId(process.env.MINDS_MIND_ID) ?? MINDS.adam;
+
+/** Accepts a friendly name ('beta') or a raw GUID; returns undefined for neither. */
+export function resolveMindId(nameOrId?: string): string | undefined {
+  if (!nameOrId) return undefined;
+  const key = nameOrId.trim().toLowerCase();
+  if (key in MINDS) return MINDS[key as MindName];
+  if (/^[0-9a-f-]{36}$/.test(key)) return key;
+  throw new Error(`Unknown mind "${nameOrId}". Known: ${Object.keys(MINDS).join(', ')}, or a GUID.`);
+}
+
+/** Reverse lookup for log lines, so output names the Mind rather than a near-identical id. */
+export function mindName(id: string): string {
+  const hit = Object.entries(MINDS).find(([, v]) => v.toLowerCase() === id.toLowerCase());
+  return hit ? hit[0] : id;
+}
 
 /** Human-facing thread (created by the webapp). Used for HITL drafts and approvals. */
 export const HUMAN_ALIAS = 'webapp:thread-1785477354652-a9tmbv';
@@ -33,13 +67,38 @@ export const client = createMindsClient({ builderApiKey });
 /**
  * The platform may only accept `webapp:`-prefixed aliases. Try the dedicated ops
  * conversation and fall back to the existing human thread rather than failing.
+ *
+ * Two guards, both learned the hard way:
+ *
+ *  - An alias already bound to a DIFFERENT Mind is never used. `ensureConversation`
+ *    succeeds on an existing conversation regardless of which Mind owns it, so without
+ *    this check a script aimed at Beta would happily deliver Beta's credential into
+ *    Adam's transcript — and the reply would look plausible, because Adam has the vault
+ *    contract in long-term memory and would answer from it.
+ *  - The HUMAN_ALIAS fallback only applies when the target IS Adam, for the same reason.
  */
-export async function resolveOpsAlias(preferred?: string): Promise<string> {
+export async function resolveOpsAlias(preferred?: string, mindId = MIND_ID): Promise<string> {
   const alias = preferred || OPS_ALIAS;
+
+  const boundTo = await client.getMindIdForAlias(alias).catch(() => undefined);
+  if (boundTo && boundTo.toLowerCase() !== mindId.toLowerCase()) {
+    throw new Error(
+      `Alias "${alias}" belongs to ${mindName(boundTo)}, but this run targets ` +
+        `${mindName(mindId)}. Pass --alias for a ${mindName(mindId)} conversation, or ` +
+        `set MINDS_MIND_ID=${mindName(boundTo)} if that is the Mind you meant.`,
+    );
+  }
+
   try {
-    await client.ensureConversation(alias, MIND_ID);
+    await client.ensureConversation(alias, mindId);
     return alias;
   } catch (err) {
+    if (mindId.toLowerCase() !== MINDS.adam.toLowerCase()) {
+      throw new Error(
+        `Alias "${alias}" rejected for ${mindName(mindId)} (${errText(err)}). Not falling ` +
+          `back to ${HUMAN_ALIAS} — that thread belongs to adam.`,
+      );
+    }
     console.warn(
       `[minds] alias "${alias}" rejected (${errText(err)}); falling back to ${HUMAN_ALIAS}`,
     );
